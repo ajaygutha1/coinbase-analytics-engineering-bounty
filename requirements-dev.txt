@@ -1,0 +1,4 @@
+# Linting and Python tests. Not needed to run the dbt project.
+pytest>=8,<9
+ruff>=0.6
+sqlfluff>=3.2,<4

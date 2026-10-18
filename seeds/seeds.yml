@@ -1,0 +1,212 @@
+version: 2
+
+# Synthetic fixtures. Every messy row is planted on purpose and has a matching test; see
+# README "Planted cases". Schemas are stated assumptions, not Coinbase production schemas.
+
+seeds:
+  - name: raw_auth_events
+    description: >
+      Stand-in for the auth service feed. Plants: a re-delivered event_id (a4 twice, different
+      ingestion), mixed-case account ids (acc-0002), a signup at 06:58Z that is the previous
+      Pacific day (ACC-0003), an abandoned registration later merged (ACC-0010 -> ACC-0011),
+      and a QA account (ACC-QA01).
+    columns:
+      - name: event_id
+        description: "Event id; duplicated on re-delivery."
+      - name: account_id
+        description: "UUID-style account id with inconsistent casing."
+      - name: email_hash
+        description: "Hashed email."
+      - name: event_name
+        description: "account_created | email_verified."
+      - name: event_ts
+        description: "ISO-8601 Z event instant."
+      - name: device_id
+        description: "Device identifier."
+      - name: ip_country
+        description: "Country at the event."
+      - name: ingested_at
+        description: "ISO-8601 Z arrival instant."
+
+  - name: raw_kyc_events
+    description: >
+      Stand-in for the KYC vendor feed. Plants: zero-padded customer_ref (001001), mixed status
+      casing, rejected -> approved retry (Bob, k2), approved -> revoked regression (Heidi, k6),
+      a case stuck in pending (Ivan, k7), a seconds-valued epoch among milliseconds (k4), and a
+      customer_ref with no crosswalk entry (9999, the intentional warn).
+    columns:
+      - name: case_id
+        description: "Vendor case id."
+      - name: customer_ref
+        description: "Legacy numeric user id, sometimes zero-padded."
+      - name: status
+        description: "pending | rejected | approved | revoked, any casing."
+      - name: updated_at_ms
+        description: "Epoch milliseconds, except k4 which is epoch seconds."
+      - name: attempt_no
+        description: "Retry counter."
+      - name: vendor
+        description: "Vendor name."
+      - name: ingested_at
+        description: "ISO-8601 Z arrival instant."
+
+  - name: raw_identity_user_xref
+    description: >
+      Stand-in for the identity crosswalk. Plants: a one-hop merge (ACC-0010 merged into
+      ACC-0011, both legacy ids preserved) and a flagged test account (ACC-QA01 / 9001).
+    columns:
+      - name: account_id
+        description: "Auth account id."
+      - name: legacy_user_id
+        description: "Legacy numeric id used by KYC and ledger."
+      - name: merged_into_account_id
+        description: "Surviving account after a merge; blank otherwise."
+      - name: is_test_account
+        description: "QA / internal flag."
+      - name: email_hash
+        description: "Hashed email on file."
+      - name: updated_at_utc
+        description: "ISO-8601 Z last change to the mapping."
+
+  - name: raw_ledger_transactions
+    description: >
+      Stand-in for the ledger. Plants: a re-org (Alice's l1-old settled, restated as l1-reorg
+      reversed under the same chain:hash:log_index, replaced by l1-new), one transaction with
+      two transfer logs plus an exact re-delivery (Carol, l3-dep-1/2), a $0 mint from the zero
+      address (Frank, l4-zero) followed by a real $25 fiat deposit, a trade settled before the
+      deposit (Grace, l5), events ingested two days late (Judy, l11), fiat rows with null chain
+      fields, and amounts delivered as strings with varying precision.
+    columns:
+      - name: txn_id
+        description: "Ledger primary key."
+      - name: user_id
+        description: "Legacy numeric user id."
+      - name: txn_type
+        description: "deposit | trade."
+      - name: status_code
+        description: "0 pending, 1 settled, 2 failed, 3 filled, 4 reversed."
+      - name: created_at_local
+        description: "Naive Pacific wall-clock creation time."
+      - name: settled_at_local
+        description: "Naive Pacific wall-clock settlement time."
+      - name: chain_id
+        description: "EVM chain id; blank on fiat rails."
+      - name: tx_hash
+        description: "On-chain hash; blank on fiat rails."
+      - name: log_index
+        description: "Transfer log index within the transaction."
+      - name: from_address
+        description: "Counterparty; blank on fiat; zero address on mints."
+      - name: amount
+        description: "Token amount as a string."
+      - name: usd_notional
+        description: "USD value as a string."
+      - name: ingested_at
+        description: "ISO-8601 Z arrival instant."
+
+  - name: ledger_status_codes
+    description: "Decode table for ledger status codes. Business SQL consumes status_name / is_settled instead of magic integers; an unknown code decodes to 'unknown' rather than silently failing a numeric comparison."
+    columns:
+      - name: status_code
+        description: "Integer code as delivered by the ledger."
+        data_tests: [not_null, unique]
+      - name: status_name
+        description: "Human-readable status."
+        data_tests: [not_null, unique]
+      - name: is_settled
+        description: "True for terminal success states (settled, filled)."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: [true, false]}
+
+  - name: ex3_users
+    description: "Exercise 3/4 population: 100 weekly active users across US/GB/DE/BR. This table is the denominator of the challenge's '41% of weekly active users made a trade'. Columns mirror the inherited query (users.country = today's country, which is flag F5). Generated by scripts/ex3_make_fixtures.py."
+    columns:
+      - name: user_id
+        description: "Person id."
+        data_tests: [not_null, unique]
+      - name: country
+        description: "CURRENT country. Retroactive attribution is one of the flags in the inherited query; ex3_user_country_history has the as-of view."
+        data_tests: [not_null]
+      - name: last_active_at
+        description: "Last activity inside the week (naive timestamp string, as the legacy pipeline stores it)."
+        data_tests: [not_null]
+
+  - name: ex3_trades
+    description: "Exercise 3/4 trades with the inherited query's column names. Planted: 34 completed trades (status 3, one status 1) for 34 users with active devices, one completed trade for U035 who has no active device, two failed trades (status 2) for otherwise non-trading users, and one trade at 2024-01-08 03:00 UTC that is inside the Pacific week but outside the legacy string-compared window."
+    columns:
+      - name: trade_id
+        description: "Trade id."
+        data_tests: [not_null, unique]
+      - name: user_id
+        description: "Person id."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('ex3_users')
+                field: user_id
+      - name: status
+        description: "Magic integer as in the inherited query: 1 and 3 mean completed, 2 failed. Decoded through ledger_status_codes in the refactor."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: [1, 2, 3]}
+      - name: created_at
+        description: "Naive timestamp string, compared as text by the inherited query."
+        data_tests: [not_null]
+
+  - name: ex3_devices
+    description: "Exercise 3/4 devices with is_active as 0/1 like the inherited query. The 34 eligible traders own 41 active devices (7 own two), which is exactly how the legacy join reports 41. U035 owns only an inactive device; two users have inactive spares that must not create rows."
+    columns:
+      - name: device_id
+        description: "Device id."
+        data_tests: [not_null, unique]
+      - name: user_id
+        description: "Owning person."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('ex3_users')
+                field: user_id
+      - name: is_active
+        description: "1 = active, 0 = inactive."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: [0, 1]}
+
+  - name: ex3_user_country_history
+    description: "Slowly-changing country history for the Exercise 3 population (valid_from inclusive, valid_to exclusive, blank = current). U001 and U058 moved after the week, so users.country attributes them to the wrong country for that week. Used by the refactor's country_as_of_week column."
+    columns:
+      - name: user_id
+        description: "Person id."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('ex3_users')
+                field: user_id
+      - name: country
+        description: "Country during the interval."
+        data_tests: [not_null]
+      - name: valid_from
+        description: "Interval start (inclusive), ISO date."
+        data_tests: [not_null]
+      - name: valid_to
+        description: "Interval end (exclusive), ISO date; blank for the current row."
+
+  - name: ex3_legacy_expected
+    description: "Frozen output of the verbatim legacy query per country, captured before the refactor. The characterization baseline; if the live legacy query drifts from this, no parity claim is valid."
+    columns:
+      - name: country
+        description: "Country as the legacy query attributes it."
+        data_tests: [not_null, unique]
+      - name: active_traders
+        description: "Frozen legacy active_traders."
+        data_tests: [not_null]
+      - name: completed_trades
+        description: "Frozen legacy completed_trades."
+        data_tests: [not_null]

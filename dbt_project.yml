@@ -1,0 +1,125 @@
+name: coinbase_bounty
+version: '1.0.0'
+config-version: 2
+profile: coinbase_bounty
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+analysis-paths: ["analyses"]
+macro-paths: ["macros"]
+clean-targets: ["target", "dbt_packages", "coinbase_bounty.duckdb"]
+
+# Policy knobs live here, not in SQL. A PM can change the deposit threshold or the reporting
+# zone with a one-line PR (or `--vars`) and every model, test and metric follows.
+vars:
+  reporting_timezone: America/Los_Angeles      # "a day" in every mart is a Pacific calendar day
+  source_ledger_timezone: America/Los_Angeles  # the ledger's naive created/settled timestamps are PT wall-clock
+  minimum_deposit_usd: 1.00                    # first deposit must be >= this USD notional to count
+  incremental_lookback_days: 3                 # re-process this many days of ingestion on each incremental run
+  late_arrival_hours: 24                       # ingestion more than this long after event time is flagged
+  use_seed_sources: true                       # false -> staging reads the production source() declarations
+  ex3_week_start_pt: '2024-01-01'              # Monday (PT) of the week in the inherited weekly_active_traders query
+
+models:
+  coinbase_bounty:
+    +group: growth_analytics
+    +persist_docs:
+      relation: true
+      columns: true
+    staging:
+      +materialized: view
+      +access: protected
+    intermediate:
+      +materialized: view
+      +access: protected
+    marts:
+      +materialized: table
+      +access: public
+    weekly:
+      +materialized: view
+      +access: public
+    utilities:
+      +materialized: table
+      +access: protected
+
+seeds:
+  coinbase_bounty:
+    +quote_columns: false
+    raw_auth_events:
+      +column_types:
+        event_id: varchar
+        account_id: varchar
+        email_hash: varchar
+        event_name: varchar
+        event_ts: varchar
+        device_id: varchar
+        ip_country: varchar
+        ingested_at: varchar
+    raw_kyc_events:
+      +column_types:
+        case_id: varchar
+        customer_ref: varchar
+        status: varchar
+        updated_at_ms: bigint
+        attempt_no: integer
+        vendor: varchar
+        ingested_at: varchar
+    raw_identity_user_xref:
+      +column_types:
+        account_id: varchar
+        legacy_user_id: varchar
+        merged_into_account_id: varchar
+        is_test_account: boolean
+        email_hash: varchar
+        updated_at_utc: varchar
+    raw_ledger_transactions:
+      +column_types:
+        txn_id: varchar
+        user_id: varchar
+        txn_type: varchar
+        status_code: integer
+        created_at_local: varchar
+        settled_at_local: varchar
+        chain_id: varchar
+        tx_hash: varchar
+        log_index: varchar
+        from_address: varchar
+        amount: varchar
+        usd_notional: varchar
+        ingested_at: varchar
+    ledger_status_codes:
+      +column_types:
+        status_code: integer
+        status_name: varchar
+        is_settled: boolean
+    ex3_users:
+      +column_types:
+        user_id: varchar
+        country: varchar
+        last_active_at: varchar
+    ex3_trades:
+      +column_types:
+        trade_id: varchar
+        user_id: varchar
+        status: integer
+        created_at: varchar
+    ex3_devices:
+      +column_types:
+        device_id: varchar
+        user_id: varchar
+        is_active: integer
+    ex3_legacy_expected:
+      +column_types:
+        country: varchar
+        active_traders: bigint
+        completed_trades: bigint
+    ex3_user_country_history:
+      +column_types:
+        user_id: varchar
+        country: varchar
+        valid_from: varchar
+        valid_to: varchar
+
+flags:
+  require_explicit_package_overrides_for_builtin_materializations: false

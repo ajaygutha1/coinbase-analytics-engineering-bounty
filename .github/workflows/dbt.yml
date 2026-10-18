@@ -1,0 +1,90 @@
+name: dbt-bounty-ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (ruff, sqlfluff, static checks, pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: ruff (Python)
+        run: ruff check scripts tests_py
+      - name: sqlfluff (SQL)
+        run: sqlfluff lint models tests analyses macros
+      - name: "Static project checks (YAML, Jinja, seed CSV widths, ref targets, guardrails, word count)"
+        run: python scripts/static_validate.py
+      - name: pytest (Exercise 2 diagnostic)
+        run: python -m pytest
+
+  build:
+    name: dbt build (full, incremental, source mode) + proofs
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      DBT_PROFILES_DIR: .
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install pinned dbt-core + dbt-duckdb
+        run: python -m pip install -r requirements.txt
+
+      - name: Seed synthetic fixtures
+        run: dbt seed --full-refresh
+      - name: Full-refresh build (models, contracts, unit tests, data tests)
+        run: dbt build --full-refresh --exclude resource_type:seed
+      - name: Incremental build (exercises merge / delete+insert / watermark paths)
+        run: dbt build --exclude resource_type:seed
+      - name: Production-source mode compiles
+        run: |
+          dbt compile --vars '{use_seed_sources: false}' --select resource_type:model
+      - name: Analyses compile (legacy verbatim, refactor, parity)
+        run: dbt compile --select resource_type:analysis
+
+      - name: "Exercise 2: generate extracts, run the blind diagnostic, assert the bridge closes"
+        run: |
+          python scripts/ex2_make_fixtures.py
+          python scripts/ex2_reconcile_signups.py
+      - name: "Exercise 2 in SQL: the same bridge from the raw CSVs must match the Python diagnostic"
+        run: |
+          dbt compile --select ex2_reconciliation_in_sql
+          python scripts/ex2_sql_crosscheck.py
+      - name: "Exercise 4: 41% legacy vs 34% person grain, gap = device fan-out"
+        run: python scripts/ex4_fanout_bridge.py
+      - name: Independent Python oracle for the planted funnel cases
+        run: python scripts/validate_funnel_fixture.py
+      - name: "Late-arrival replay: inject a Thursday-arriving Monday event, run the incremental path, assert only that person moved"
+        run: python scripts/incremental_replay.py
+      - name: What the Friday deck depends on
+        run: dbt ls --select +exposure:growth_onboarding_review_deck --resource-type model --output name
+
+      - name: dbt docs + Mermaid lineage
+        run: |
+          dbt docs generate
+          python scripts/render_lineage.py
+          git diff --exit-code -- docs/LINEAGE.md || (echo "docs/LINEAGE.md is stale; run scripts/render_lineage.py" && exit 1)
+      - name: Upload dbt docs + run artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-docs
+          path: |
+            target/index.html
+            target/manifest.json
+            target/catalog.json
+            target/run_results.json
+          retention-days: 30

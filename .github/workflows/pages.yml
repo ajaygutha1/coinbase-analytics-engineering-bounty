@@ -1,0 +1,51 @@
+name: publish-dbt-docs
+
+# Publishes the dbt docs site to GitHub Pages. Pages needs the repository to be public (or a paid
+# plan), so this workflow is manual: enable Pages with source "GitHub Actions" in Settings, then
+# run it from the Actions tab or `gh workflow run publish-dbt-docs`.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DBT_PROFILES_DIR: .
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: dbt seed --full-refresh
+      - run: dbt build --full-refresh --exclude resource_type:seed
+      - run: dbt docs generate --static
+      - name: Stage the single-file docs site
+        run: |
+          mkdir -p site
+          cp target/static_index.html site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

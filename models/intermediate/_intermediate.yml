@@ -1,0 +1,218 @@
+version: 2
+
+# Intermediate layer: where all the judgment lives, so it can be tested in isolation.
+# Allowed: identity resolution, union, semantic dedupe, choosing the first success.
+# Never: anything a PM would query directly. Grain moves from event -> person x step here.
+
+models:
+  - name: int_identity__resolved
+    description: >
+      Canonical person mapping. Grain: one row per account_id (and, by the tests below, one
+      per legacy_user_id). Follows a single merge pointer to the surviving account, inherits the
+      survivor's test-account flag, and derives `user_sk` as a hash of the canonical account.
+      Two conditions are FLAGGED instead of resolved by guesswork: a merge pointing at an
+      account that does not exist, and a merge chain longer than one hop. Both must be zero
+      (accepted_values [false]) so identity problems fail loudly before they reach a mart.
+      Email hashes are never used as keys; a hash shared by two people is flagged.
+    columns:
+      - name: user_sk
+        description: "Person surrogate key: md5 of canonical_account_id. The ONLY user key allowed downstream of this model. Merged accounts share one user_sk."
+        data_tests: [not_null]
+      - name: canonical_account_id
+        description: "Surviving auth account after following the merge pointer. Equal to account_id for unmerged accounts."
+        data_tests: [not_null]
+      - name: account_id
+        description: "Auth account id as it appears in the auth feed. Unique: one mapping row per account."
+        data_tests: [not_null, unique]
+      - name: legacy_user_id
+        description: "Numeric legacy id used by KYC and the ledger. Unique: one mapping row per legacy id, so KYC/ledger joins cannot fan out."
+        data_tests: [not_null, unique]
+      - name: email_hash
+        description: "Hashed email on file; attribute only."
+      - name: is_test_account
+        description: "True for internal/QA people. Inherited from the surviving account on merge. Excluded in marts, retained here for audit."
+        data_tests: [not_null]
+      - name: is_dangling_merge
+        description: "True when merged_into_account_id points at an account that is not in the crosswalk. Must be false everywhere; a true value is an identity-team incident."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: [false]}
+      - name: is_multi_hop_merge
+        description: "True when the surviving account has itself been merged (A -> B -> C). The model resolves one hop only, so this must be false everywhere."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: [false]}
+      - name: is_email_hash_collision
+        description: "True when this person's email_hash is attached to more than one user_sk. Informational; explains why email is never a join key."
+        data_tests: [not_null]
+      - name: xref_updated_at_utc
+        description: "Last change to the mapping row. Used by int_funnel__events to re-process historical events for people whose identity changed."
+        data_tests: [not_null]
+
+  - name: int_funnel__events
+    description: >
+      The canonical long event table: one row per semantic event across auth, KYC and ledger,
+      resolved to a person, with terminal-success and quality flags. Incremental merge on
+      `event_key`, watermarked on INGESTION time with a lookback window, so an event that
+      happened Monday and arrived Thursday is still processed. For on-chain ledger rows the
+      key is chain_id:tx_hash:log_index, so a re-org restatement (settled -> reversed) of the
+      same transfer UPDATES the existing row instead of creating a second deposit.
+      Identity joins are LEFT joins: an unresolved id is a flagged row, never a dropped one.
+      Test accounts and unresolved identities are retained here and filtered only downstream.
+    columns:
+      - name: event_key
+        description: "Stable semantic key: `auth|event_id`, `kyc|case|attempt|status|instant`, `ledger|chain:hash:log_index` or `ledger|txn_id`. Unique; the merge key."
+        data_tests: [not_null, unique]
+      - name: source_system
+        description: "auth | kyc | ledger. Which feed produced the row."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: ['auth', 'kyc', 'ledger']}
+      - name: source_event_id
+        description: "The raw row's own identifier (event_id, KYC status-change composite, or ledger txn_id). Audit trail back to staging."
+        data_tests: [not_null]
+      - name: user_sk
+        description: "Resolved person key from int_identity__resolved. Null when the id could not be resolved (see is_identity_unresolved)."
+      - name: canonical_account_id
+        description: "Surviving auth account for the person; null when unresolved."
+      - name: source_account_id
+        description: "Auth account id as delivered (auth rows only)."
+      - name: legacy_user_id
+        description: "Legacy user id as delivered (KYC and ledger rows only)."
+      - name: funnel_step
+        description: "Funnel step this event belongs to. Defined once in macros/funnel_steps.sql."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['signed_up', 'email_verified', 'identity_verified', 'first_deposit', 'first_trade']
+      - name: step_ordinal
+        description: "1..5 position of funnel_step. Used by the strict funnel walk."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: [1, 2, 3, 4, 5]}
+      - name: event_at_utc
+        description: "When the event happened, in UTC. For ledger rows: settled_at_utc if present, else created_at_utc."
+        data_tests: [not_null]
+      - name: ingested_at_utc
+        description: "When the warehouse received the row, in UTC. Drives the incremental watermark."
+        data_tests: [not_null]
+      - name: is_terminal_success
+        description: "True only when this event completes its step: account_created / email_verified as delivered, KYC approved, deposit settled at/above the USD threshold from a non-zero address, trade filled. Always two-valued; a null here would silently drop the row from every count."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: [true, false]}
+      - name: is_negative_outcome
+        description: "True for KYC rejected/revoked and ledger failed/reversed. Counted per step, never advances the funnel."
+        data_tests: [not_null]
+      - name: is_kyc_revocation
+        description: "True for a KYC `revoked` status change. A revocation after approval becomes a mart flag, not an erasure of the approval."
+        data_tests: [not_null]
+      - name: is_test_account
+        description: "Person is an internal/QA account. Retained here, excluded from marts."
+        data_tests: [not_null]
+      - name: is_identity_unresolved
+        description: "True when the source id has no crosswalk entry. The row stays here (a warn-level test counts them) and cannot enter person-grain marts."
+        data_tests: [not_null]
+      - name: is_email_hash_collision
+        description: "Person's email hash is shared with another person. Informational."
+        data_tests: [not_null]
+      - name: signup_country
+        description: "ip_country at the account_created event (auth rows only). Country at signup, not current country."
+      - name: usd_notional
+        description: "USD notional of the ledger event (DECIMAL(38,8)); null for auth/KYC rows."
+      - name: deposit_rail
+        description: "onchain | fiat | internal for ledger rows; null otherwise."
+        data_tests:
+          - accepted_values:
+              arguments: {values: ['onchain', 'fiat', 'internal']}
+      - name: has_amount_precision_issue
+        description: "Ledger token amount could not be parsed into DECIMAL(38,18). Flag only; the funnel does not use the token amount."
+        data_tests: [not_null]
+      - name: has_usd_precision_issue
+        description: "Ledger USD notional could not be parsed. Such a row can never be a first-deposit success."
+        data_tests: [not_null]
+      - name: is_from_zero_address
+        description: "Ledger row originated from the protocol mint/burn address. Never a first deposit."
+        data_tests: [not_null]
+      - name: is_dst_ambiguous_local_time
+        description: "Ledger wall-clock time fell in the repeated fall-back hour; the UTC instant is a best guess."
+        data_tests: [not_null]
+      - name: is_dst_nonexistent_local_time
+        description: "Ledger wall-clock time fell in the spring-forward gap; the UTC instant was shifted forward by the warehouse."
+        data_tests: [not_null]
+      - name: is_late_arriving
+        description: "Ingested more than `late_arrival_hours` (default 24) after the event happened. Explains restated cohorts."
+        data_tests: [not_null]
+      - name: identity_updated_at_utc
+        description: "xref_updated_at_utc of the person at processing time. Lets downstream models detect people whose identity changed."
+      - name: _processed_at_utc
+        description: "UTC instant this row was last written by the incremental run. Operational metadata."
+        data_tests: [not_null]
+
+  - name: int_funnel__user_steps
+    description: >
+      One row per canonical person x funnel step, for people with a resolved identity who are
+      not test accounts. `first_success_at_utc` is the minimum instant of a terminal success;
+      attempts, pending states, rejections and revocations are counted in n_* columns and never
+      advance the step. First-success detail (rail, USD, country) is picked deterministically by
+      (event_at_utc, event_key) so a timestamp tie cannot change the answer between runs.
+      Incremental delete+insert on (user_sk, funnel_step), recomputing only people touched by
+      new events or identity changes; a post-hook removes rows for people who no longer exist
+      after a merge/re-key.
+    columns:
+      - name: user_sk
+        description: "Person key. With funnel_step forms the unique grain (enforced by assert_user_step_grain_unique)."
+        data_tests: [not_null]
+      - name: funnel_step
+        description: "Funnel step name."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['signed_up', 'email_verified', 'identity_verified', 'first_deposit', 'first_trade']
+      - name: step_ordinal
+        description: "1..5 position of the step."
+        data_tests: [not_null]
+      - name: first_success_at_utc
+        description: "Instant of the first terminal success for this person and step; null when the step was never completed."
+      - name: n_events
+        description: "All events seen for this person and step, including attempts and failures."
+        data_tests: [not_null]
+      - name: n_negative_events
+        description: "Rejections, revocations, failures and reversals for this step."
+        data_tests: [not_null]
+      - name: n_kyc_revocations
+        description: "Number of KYC `revoked` status changes (identity_verified step only)."
+        data_tests: [not_null]
+      - name: has_late_arrival
+        description: "Any event for this step arrived more than the late-arrival window after it happened."
+        data_tests: [not_null]
+      - name: has_precision_issue
+        description: "Any event for this step had an unparseable amount or USD notional."
+        data_tests: [not_null]
+      - name: has_dst_ambiguity
+        description: "Any event for this step had a wall-clock time in the DST fall-back hour."
+        data_tests: [not_null]
+      - name: has_dst_gap
+        description: "Any event for this step had a wall-clock time in the DST spring-forward gap."
+        data_tests: [not_null]
+      - name: has_email_hash_collision
+        description: "Person shares an email hash with another person."
+        data_tests: [not_null]
+      - name: canonical_account_id
+        description: "Surviving auth account of the person at first success; null when the step was never completed."
+      - name: signup_country
+        description: "Country at the signed_up success (signed_up step only)."
+      - name: first_success_usd_notional
+        description: "USD notional of the first successful deposit (first_deposit step only)."
+      - name: first_success_deposit_rail
+        description: "Rail of the first successful deposit: onchain | fiat | internal (first_deposit step only)."
+      - name: _updated_at_utc
+        description: "Max ingestion instant among this person-step's events. Incremental watermark for downstream marts."
+        data_tests: [not_null]

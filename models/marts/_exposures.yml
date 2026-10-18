@@ -1,0 +1,14 @@
+version: 2
+
+exposures:
+  - name: growth_onboarding_review_deck
+    label: Growth Onboarding Friday Review
+    type: dashboard
+    maturity: high
+    url: https://github.com/ajaygutha1/coinbase-analytics-engineering-bounty#metric-definitions
+    description: "Friday Growth review consuming the governed onboarding funnel metrics."
+    depends_on:
+      - ref('fct_onboarding_funnel_daily')
+    owner:
+      name: Ajay Gutha
+      email: ajaygutha1@gmail.com

@@ -1,0 +1,178 @@
+version: 2
+
+# Exercises 3 and 4 as code. One model name serves both definitions of "weekly active traders"
+# so dashboards pinned to v1 keep working until the deprecation date, new work gets v2 by
+# default, and dbt warns anyone still on v1. The bridge model is the slide that explains the gap.
+
+models:
+  - name: fct_weekly_active_traders
+    description: >
+      Weekly active traders as a share of weekly active users, for the Pacific week starting at
+      var `ex3_week_start_pt`. Versioned so the legacy definition (v1, the two-year-old dashboard)
+      and the corrected person-grain definition (v2) can be dual-run side by side, bridged on one
+      slide, and v1 retired on a date rather than in a surprise.
+    latest_version: 2
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: week_start_pt
+        description: "Monday (Pacific) of the reporting week."
+        data_type: date
+        data_tests: [not_null, unique]
+      - name: weekly_active_traders
+        description: "Numerator. v1: completed-trade rows after the trades x devices join (a person with N active devices counts N times). v2: distinct people with a completed trade inside the PT week who have >= 1 active device."
+        data_type: bigint
+        data_tests: [not_null]
+      - name: weekly_active_users
+        description: "Denominator: users active in the same week (the challenge's '41% of weekly active users')."
+        data_type: bigint
+        data_tests: [not_null]
+      - name: trader_share_of_active_users
+        description: "weekly_active_traders / weekly_active_users. 0.41 under v1 and 0.34 under v2 on the fixture."
+        data_type: double
+        data_tests: [not_null]
+    versions:
+      - v: 1
+        description: >
+          LEGACY. The inherited query's core logic verbatim: comma joins of users, trades, devices;
+          status 1 or 3 hard-coded; string-compared UTC-less week; INNER join on active devices.
+          Exposes legacy_distinct_users_any_status (36 on the fixture) to show that its own
+          COUNT(DISTINCT) also counts users whose only trade failed. Retained for the parity
+          bridge; deprecated after two dual-run review cycles.
+        deprecation_date: 2026-11-13
+        columns:
+          - include: all
+          - name: legacy_distinct_users_any_status
+            description: "The legacy query's COUNT(DISTINCT t.user_id): any trade row in the window, including failed trades (F6)."
+            data_type: bigint
+      - v: 2
+        description: >
+          CURRENT. Distinct weekly active users with a completed trade (status decoded through
+          ledger_status_codes) inside the Pacific week, who have at least one active device
+          (EXISTS semi-join, so device multiplicity cannot change the count).
+        columns:
+          - include: all
+            exclude: [legacy_distinct_users_any_status]
+
+  - name: rpt_weekly_active_traders_bridge
+    description: >
+      The Exercise 4 slide as a table. Per country and in total: the legacy numerator
+      (completed-trade rows after the devices fan-out), the excess rows created by multi-device
+      traders, the person-grain numerator, and the two side effects of the inherited query that
+      are NOT the fan-out (failed-only users counted by its COUNT(DISTINCT); traders dropped by
+      the active-device inner join). `bridge_closes` must be true on every row.
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: week_start_pt
+        data_type: date
+        description: "Monday (Pacific) of the reporting week."
+        data_tests: [not_null]
+      - name: country
+        data_type: varchar
+        description: "users.country (today's country, to reconcile with the legacy output) or 'ALL'."
+        data_tests: [not_null]
+      - name: weekly_active_users
+        data_type: bigint
+        description: "Denominator for both shares."
+        data_tests: [not_null]
+      - name: legacy_completed_trade_rows
+        data_type: bigint
+        description: "Sum of completed trades x active devices: the number the legacy dashboard has been dividing by active users."
+        data_tests: [not_null]
+      - name: fanout_excess_rows
+        data_type: bigint
+        description: "Rows that exist only because a trader owns more than one active device. The whole 41% -> 34% gap on the fixture."
+        data_tests: [not_null]
+      - name: v2_active_traders
+        data_type: bigint
+        description: "Distinct people with a completed trade and an active device."
+        data_tests: [not_null]
+      - name: legacy_distinct_users_any_status
+        data_type: bigint
+        description: "The legacy query's own COUNT(DISTINCT user_id): includes users whose only trades failed."
+        data_tests: [not_null]
+      - name: failed_only_users
+        data_type: bigint
+        description: "Users in the legacy distinct count whose trades in the week all failed (status 2)."
+        data_tests: [not_null]
+      - name: traders_without_active_device
+        data_type: bigint
+        description: "Users with a completed trade but no active device; excluded by both definitions because the rule is kept, but now counted so the exclusion is visible."
+        data_tests: [not_null]
+      - name: legacy_share
+        data_type: double
+        description: "legacy_completed_trade_rows / weekly_active_users (0.41 in total on the fixture)."
+        data_tests: [not_null]
+      - name: v2_share
+        data_type: double
+        description: "v2_active_traders / weekly_active_users (0.34 in total on the fixture)."
+        data_tests: [not_null]
+      - name: bridge_closes
+        data_type: boolean
+        description: "True when legacy rows - fan-out excess = v2 people AND legacy distinct - failed-only = v2 people. Any false row means an unexplained definitional change."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: [true]}
+
+  - name: rpt_ex3_legacy_characterization
+    description: >
+      The inherited weekly_active_traders core logic, verbatim, grouped by country. This is the
+      characterization baseline: `assert_ex3_legacy_characterization_frozen` compares it to the
+      output frozen in `seeds/ex3_legacy_expected.csv` before any refactoring started, and the
+      refactor's parity is measured against it. Nothing in this model is corrected on purpose.
+    columns:
+      - name: country
+        description: "users.country (today's country), as the legacy query attributes it."
+        data_tests: [not_null, unique]
+      - name: active_traders
+        description: "Legacy COUNT(DISTINCT t.user_id): any trade row in the window, any status, with an active device (flags F4, F6)."
+        data_tests: [not_null]
+      - name: completed_trades
+        description: "Legacy SUM(status in (1,3)) over the trades x devices join: inflated by the device multiplier (flag F1)."
+        data_tests: [not_null]
+
+  - name: rpt_ex3_trade_walk
+    description: >
+      Walk from completed trades in the week (one row per trade, the closest thing to ground truth)
+      to the legacy dashboard's completed_trades. The device inner join removes some trades and the
+      devices fan-out repeats others; the two defects partly cancel, which is why the total looked
+      plausible. Pinned to the bridge by `assert_ex3_trade_walk_closes_to_dashboard`.
+    columns:
+      - name: step_order
+        description: "Position in the walk (1 truth, 2 and 4 adjustments, 3 and 5 subtotals)."
+        data_tests: [not_null, unique]
+      - name: step
+        description: "Plain-language name of the line."
+        data_tests: [not_null]
+      - name: trades
+        description: "Signed trade count for the line; subtotals are exact sums of the lines above."
+        data_tests: [not_null]
+
+  - name: rpt_ex4_alternative_explanations
+    description: >
+      Rival definitions of "share of weekly active users who traded", on the same week and denominator.
+      Only the device-grain definition reproduces the legacy 41%, so the fan-out is the cause, not just
+      a cause (`assert_ex4_only_fanout_reproduces_41`). Run before the stakeholder conversation.
+    columns:
+      - name: hypothesis
+        description: "Which rival definition the row recomputes."
+        data_tests: [not_null, unique]
+      - name: mechanism
+        description: "The mechanism the hypothesis tests."
+        data_tests: [not_null]
+      - name: numerator
+        description: "Count under that definition."
+        data_tests: [not_null]
+      - name: weekly_active_users
+        description: "Shared denominator."
+        data_tests: [not_null]
+      - name: share
+        description: "numerator / weekly_active_users."
+        data_tests: [not_null]
+      - name: reproduces_legacy_41
+        description: "True when the share equals the legacy 0.41."
+        data_tests: [not_null]

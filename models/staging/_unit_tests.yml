@@ -1,0 +1,158 @@
+version: 2
+
+# Unit tests hand a model a handful of synthetic rows and assert the exact output, with no
+# warehouse data involved. They pin the tricky logic in place: dedupe direction, epoch
+# decoding, precision overflow, the zero-address sentinel, DST edge cases, and the
+# observed-vs-strict funnel walk.
+
+unit_tests:
+  - name: auth_redelivery_keeps_earliest_ingestion
+    description: "Two copies of the same event_id: the earliest ingestion survives and the id is upper-cased."
+    model: stg_auth__events
+    given:
+      - input: ref('raw_auth_events')
+        format: dict
+        rows:
+          - {event_id: x1, account_id: acc-x, email_hash: h, event_name: account_created, event_ts: '2026-09-14T12:00:00Z', device_id: d, ip_country: us, ingested_at: '2026-09-14T12:00:02Z'}
+          - {event_id: x1, account_id: ACC-X, email_hash: h, event_name: account_created, event_ts: '2026-09-14T12:00:00Z', device_id: d, ip_country: us, ingested_at: '2026-09-14T12:05:02Z'}
+    expect:
+      format: dict
+      rows:
+        - {event_id: x1, account_id: ACC-X, event_name: account_created, ip_country: US, ingested_at_utc: '2026-09-14 12:00:02'}
+
+  - name: kyc_epoch_seconds_and_milliseconds_normalize
+    description: "A seconds-valued and a milliseconds-valued epoch for the same instant decode to the same UTC timestamp; zero-padded customer_ref is stripped."
+    model: stg_kyc__events
+    given:
+      - input: ref('raw_kyc_events')
+        format: dict
+        rows:
+          - {case_id: s, customer_ref: '00042', status: APPROVED, updated_at_ms: 1789401600, attempt_no: 1, vendor: v, ingested_at: '2026-09-14T16:00:00Z'}
+          - {case_id: ms, customer_ref: '00043', status: approved, updated_at_ms: 1789401600000, attempt_no: 1, vendor: v, ingested_at: '2026-09-14T16:00:00Z'}
+    expect:
+      format: dict
+      rows:
+        - {case_id: s, legacy_user_id: '42', status_name: approved, event_at_utc: '2026-09-14 16:00:00'}
+        - {case_id: ms, legacy_user_id: '43', status_name: approved, event_at_utc: '2026-09-14 16:00:00'}
+
+  - name: ledger_precision_overflow_becomes_flag_not_crash
+    description: "A 39-digit token amount cannot fit DECIMAL(38,18): the parse yields null and a flag, the raw string is kept, and the USD notional still parses."
+    model: stg_ledger__transactions
+    given:
+      - input: ref('raw_ledger_transactions')
+        format: dict
+        rows:
+          - {txn_id: p1, user_id: 1, txn_type: deposit, status_code: 1, created_at_local: '2026-09-14 10:00:00', settled_at_local: '2026-09-14 10:01:00', chain_id: '', tx_hash: '', log_index: '', from_address: '', amount: '123456789012345678901234567890123456789.123', usd_notional: '5.00', ingested_at: '2026-09-14T17:01:00Z'}
+      - input: ref('ledger_status_codes')
+        format: dict
+        rows:
+          - {status_code: 1, status_name: settled, is_settled: true}
+    expect:
+      format: dict
+      rows:
+        - {txn_id: p1, status_name: settled, is_settled: true, has_amount_precision_issue: true, has_usd_precision_issue: false, amount_raw: '123456789012345678901234567890123456789.123'}
+
+  - name: ledger_zero_address_is_flagged_and_nulled_and_null_address_is_not
+    description: "The zero address becomes is_from_zero_address = true with the address nulled; a genuinely null fiat address yields false, never null (the bug that once dropped every fiat deposit)."
+    model: stg_ledger__transactions
+    given:
+      - input: ref('raw_ledger_transactions')
+        format: dict
+        rows:
+          - {txn_id: z1, user_id: 1, txn_type: deposit, status_code: 1, created_at_local: '2026-09-14 10:00:00', settled_at_local: '2026-09-14 10:01:00', chain_id: '1', tx_hash: '0xABC', log_index: '0', from_address: '0x0000000000000000000000000000000000000000', amount: '0', usd_notional: '0', ingested_at: '2026-09-14T17:01:00Z'}
+          - {txn_id: f1, user_id: 1, txn_type: deposit, status_code: 1, created_at_local: '2026-09-14 10:00:00', settled_at_local: '2026-09-14 10:01:00', chain_id: '', tx_hash: '', log_index: '', from_address: '', amount: '50', usd_notional: '50.00', ingested_at: '2026-09-14T17:01:00Z'}
+      - input: ref('ledger_status_codes')
+        format: dict
+        rows:
+          - {status_code: 1, status_name: settled, is_settled: true}
+    expect:
+      format: dict
+      rows:
+        - {txn_id: z1, is_from_zero_address: true, from_address: null, deposit_rail: onchain, ledger_business_key: '1:0xabc:0'}
+        - {txn_id: f1, is_from_zero_address: false, from_address: null, deposit_rail: fiat, ledger_business_key: f1}
+
+  - name: ledger_dst_edge_cases_are_flagged_not_guessed
+    description: "01:30 on the November fall-back date occurs twice (ambiguous); 02:30 on the March spring-forward date never occurs (nonexistent); an ordinary timestamp raises neither flag. UTC conversion still completes for all three."
+    model: stg_ledger__transactions
+    given:
+      - input: ref('raw_ledger_transactions')
+        format: dict
+        rows:
+          - {txn_id: amb, user_id: 1, txn_type: deposit, status_code: 1, created_at_local: '2026-11-01 01:30:00', settled_at_local: '2026-11-01 01:31:00', chain_id: '', tx_hash: '', log_index: '', from_address: '', amount: '5', usd_notional: '5.00', ingested_at: '2026-11-01T10:00:00Z'}
+          - {txn_id: gap, user_id: 1, txn_type: deposit, status_code: 1, created_at_local: '2026-03-08 02:30:00', settled_at_local: '2026-03-08 03:31:00', chain_id: '', tx_hash: '', log_index: '', from_address: '', amount: '5', usd_notional: '5.00', ingested_at: '2026-03-08T11:00:00Z'}
+          - {txn_id: ok, user_id: 1, txn_type: deposit, status_code: 1, created_at_local: '2026-09-14 10:00:00', settled_at_local: '2026-09-14 10:01:00', chain_id: '', tx_hash: '', log_index: '', from_address: '', amount: '5', usd_notional: '5.00', ingested_at: '2026-09-14T17:01:00Z'}
+      - input: ref('ledger_status_codes')
+        format: dict
+        rows:
+          - {status_code: 1, status_name: settled, is_settled: true}
+    expect:
+      format: dict
+      rows:
+        - {txn_id: amb, is_dst_ambiguous_local_time: true, is_dst_nonexistent_local_time: false}
+        - {txn_id: gap, is_dst_ambiguous_local_time: false, is_dst_nonexistent_local_time: true}
+        - {txn_id: ok, is_dst_ambiguous_local_time: false, is_dst_nonexistent_local_time: false}
+
+  - name: funnel_trade_before_deposit_splits_observed_and_strict
+    description: "A person whose first trade settled before their first deposit reaches observed step 5 but strict step 4, and the disagreement is named in data_quality_flags. A clean person reads 5/5 with no flags."
+    model: fct_onboarding_funnel
+    overrides:
+      macros:
+        is_incremental: false
+    given:
+      - input: ref('int_funnel__user_steps')
+        format: dict
+        rows:
+          - {user_sk: g, funnel_step: signed_up,         step_ordinal: 1, first_success_at_utc: '2026-09-14 19:00:00', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-G, signup_country: US}
+          - {user_sk: g, funnel_step: email_verified,    step_ordinal: 2, first_success_at_utc: '2026-09-14 19:03:00', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-G}
+          - {user_sk: g, funnel_step: identity_verified, step_ordinal: 3, first_success_at_utc: '2026-09-14 19:20:00', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-G}
+          - {user_sk: g, funnel_step: first_deposit,     step_ordinal: 4, first_success_at_utc: '2026-09-14 20:01:00', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-G, first_success_usd_notional: 100, first_success_deposit_rail: fiat}
+          - {user_sk: g, funnel_step: first_trade,       step_ordinal: 5, first_success_at_utc: '2026-09-14 19:30:10', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-G}
+          - {user_sk: c, funnel_step: signed_up,         step_ordinal: 1, first_success_at_utc: '2026-09-14 15:00:00', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-C, signup_country: US}
+          - {user_sk: c, funnel_step: email_verified,    step_ordinal: 2, first_success_at_utc: '2026-09-14 15:05:00', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-C}
+          - {user_sk: c, funnel_step: identity_verified, step_ordinal: 3, first_success_at_utc: '2026-09-14 15:20:00', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-C}
+          - {user_sk: c, funnel_step: first_deposit,     step_ordinal: 4, first_success_at_utc: '2026-09-14 15:46:00', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-C, first_success_usd_notional: 20, first_success_deposit_rail: onchain}
+          - {user_sk: c, funnel_step: first_trade,       step_ordinal: 5, first_success_at_utc: '2026-09-14 16:00:10', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-C}
+    expect:
+      format: dict
+      rows:
+        - {user_sk: g, furthest_step_observed: 5, furthest_step_strict: 4, has_sequence_anomaly: true,  data_quality_flags: trade_before_deposit, signup_date_pt: '2026-09-14'}
+        - {user_sk: c, furthest_step_observed: 5, furthest_step_strict: 5, has_sequence_anomaly: false, data_quality_flags: '', signup_date_pt: '2026-09-14'}
+
+  - name: funnel_pacific_boundary_places_late_utc_signup_on_previous_pt_day
+    description: "06:58 UTC on Sep 14 is 23:58 PT on Sep 13: the UTC date and the Pacific cohort day differ by exactly one day and the person lands in the Sep 13 cohort."
+    model: fct_onboarding_funnel
+    overrides:
+      macros:
+        is_incremental: false
+    given:
+      - input: ref('int_funnel__user_steps')
+        format: dict
+        rows:
+          - {user_sk: b, funnel_step: signed_up, step_ordinal: 1, first_success_at_utc: '2026-09-14 06:58:00', n_events: 1, n_negative_events: 0, n_kyc_revocations: 0, has_late_arrival: false, has_precision_issue: false, has_dst_ambiguity: false, has_dst_gap: false, has_email_hash_collision: false, canonical_account_id: ACC-B, signup_country: US}
+    expect:
+      format: dict
+      rows:
+        - {user_sk: b, signup_date_utc: '2026-09-14', signup_date_pt: '2026-09-13', signup_week_pt: '2026-09-07', furthest_step_observed: 1, furthest_step_strict: 1}
+
+  - name: identity_flags_multi_hop_and_dangling_merges_instead_of_guessing
+    description: "A -> B -> C is a multi-hop chain (flagged on A, resolved one hop to B); X -> Z where Z does not exist is a dangling merge (flagged, X stays canonical); the survivor's test flag is inherited (T -> Q where Q is a test account). Merges are never followed further than the data supports."
+    model: int_identity__resolved
+    given:
+      - input: ref('stg_identity__user_xref')
+        format: dict
+        rows:
+          - {account_id: A, legacy_user_id: '1', merged_into_account_id: B, is_test_account: false, email_hash: ha, xref_updated_at_utc: '2026-09-01 00:00:00'}
+          - {account_id: B, legacy_user_id: '2', merged_into_account_id: C, is_test_account: false, email_hash: hb, xref_updated_at_utc: '2026-09-01 00:00:00'}
+          - {account_id: C, legacy_user_id: '3', merged_into_account_id: null, is_test_account: false, email_hash: hc, xref_updated_at_utc: '2026-09-01 00:00:00'}
+          - {account_id: X, legacy_user_id: '4', merged_into_account_id: Z, is_test_account: false, email_hash: hx, xref_updated_at_utc: '2026-09-01 00:00:00'}
+          - {account_id: T, legacy_user_id: '5', merged_into_account_id: Q, is_test_account: false, email_hash: ht, xref_updated_at_utc: '2026-09-01 00:00:00'}
+          - {account_id: Q, legacy_user_id: '6', merged_into_account_id: null, is_test_account: true, email_hash: ht, xref_updated_at_utc: '2026-09-01 00:00:00'}
+    expect:
+      format: dict
+      rows:
+        - {account_id: A, canonical_account_id: B, is_multi_hop_merge: true,  is_dangling_merge: false, is_test_account: false, is_email_hash_collision: false}
+        - {account_id: B, canonical_account_id: C, is_multi_hop_merge: false, is_dangling_merge: false, is_test_account: false, is_email_hash_collision: false}
+        - {account_id: C, canonical_account_id: C, is_multi_hop_merge: false, is_dangling_merge: false, is_test_account: false, is_email_hash_collision: false}
+        - {account_id: X, canonical_account_id: X, is_multi_hop_merge: false, is_dangling_merge: true,  is_test_account: false, is_email_hash_collision: false}
+        - {account_id: T, canonical_account_id: Q, is_multi_hop_merge: false, is_dangling_merge: false, is_test_account: true,  is_email_hash_collision: false}
+        - {account_id: Q, canonical_account_id: Q, is_multi_hop_merge: false, is_dangling_merge: false, is_test_account: true,  is_email_hash_collision: false}

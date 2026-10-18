@@ -1,0 +1,210 @@
+version: 2
+
+# Staging layer: one view per source. Allowed: rename, cast to UTC, canonicalize ids, decode
+# codes, drop EXACT re-deliveries. Never: joins across sources, business logic, filtering rows.
+# Every timestamp leaving this layer is a naive TIMESTAMP holding the UTC instant (`_at_utc`).
+
+models:
+  - name: stg_auth__events
+    description: >
+      Auth service events normalized to canonical account ids and UTC instants.
+      Grain: one row per event_id. Exact re-deliveries (same event_id) are collapsed to the
+      earliest ingestion, because the first copy is the one that was acted on. No rows are
+      filtered here; non-funnel event names are dropped downstream so the exclusion is visible.
+    columns:
+      - name: event_id
+        description: "Auth event identifier. Unique after exact re-delivery dedupe; the audit key back to the raw row."
+        data_tests: [not_null, unique]
+      - name: account_id
+        description: "Canonical (upper-cased, trimmed) auth account id. Joins to stg_identity__user_xref.account_id."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_identity__user_xref')
+                field: account_id
+              config:
+                severity: warn
+      - name: email_hash
+        description: "Hashed email at event time. Attribute only; never used as a join key."
+      - name: event_name
+        description: "Lower-cased event type. `account_created` and `email_verified` advance the funnel; anything else is retained but ignored downstream."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['account_created', 'email_verified']
+              config:
+                severity: warn
+      - name: event_at_utc
+        description: "Event instant in UTC (naive timestamp). Source: ISO-8601 Z string."
+        data_tests: [not_null]
+      - name: device_id
+        description: "Device that fired the event. Shared and unstable, so an attribute only."
+      - name: ip_country
+        description: "Upper-cased ISO country inferred at the event. Becomes signup_country: the country at signup, not the current country."
+      - name: ingested_at_utc
+        description: "Warehouse arrival instant in UTC. Used for the incremental watermark and the late-arrival flag, never for business logic."
+        data_tests: [not_null]
+
+  - name: stg_kyc__events
+    description: >
+      KYC vendor status history normalized to canonical legacy user ids and UTC instants.
+      Grain: one row per status change (case_id x attempt_no x status x instant). Nothing is
+      deduped: rejected -> approved is a normal journey and approved -> revoked is a compliance
+      fact, so every row is kept and the first approval is chosen downstream.
+      Epoch values arrive in seconds or milliseconds; values under 1e11 are treated as seconds.
+    columns:
+      - name: case_id
+        description: "Vendor case identifier. One case spans many status rows."
+        data_tests: [not_null]
+      - name: legacy_user_id
+        description: "Numeric legacy user id cast through bigint to strip zero-padding, stored as varchar. Same id space as the ledger; resolved to a person via the crosswalk. One planted row (9999) has no crosswalk entry and is expected to warn."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_identity__user_xref')
+                field: legacy_user_id
+              config:
+                severity: warn
+      - name: status_name
+        description: "Lower-cased vendor status. Only `approved` is a terminal success for the identity_verified step."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['pending', 'rejected', 'approved', 'revoked']
+      - name: event_at_utc
+        description: "Status-change instant in UTC, decoded from mixed epoch seconds/milliseconds."
+        data_tests: [not_null]
+      - name: attempt_no
+        description: "Retry counter within the case. Part of the semantic event key so two changes in one second remain distinct."
+        data_tests: [not_null]
+      - name: vendor
+        description: "KYC vendor name."
+      - name: ingested_at_utc
+        description: "Warehouse arrival instant in UTC."
+        data_tests: [not_null]
+
+  - name: stg_identity__user_xref
+    description: >
+      Account <-> legacy user id crosswalk with ids canonicalized to the same spelling used by
+      every other staging model. Grain: one row per account_id. Merge pointers and the
+      test-account flag pass through untouched; following the pointers is the job of
+      int_identity__resolved.
+    columns:
+      - name: account_id
+        description: "Canonical auth account id. Unique: the crosswalk must never fan out an auth join."
+        data_tests: [not_null, unique]
+      - name: legacy_user_id
+        description: "Canonical numeric legacy id (zero-padding stripped). Unique: the crosswalk must never fan out a KYC or ledger join."
+        data_tests: [not_null, unique]
+      - name: merged_into_account_id
+        description: "Surviving account when support merged this registration into another; null otherwise."
+      - name: is_test_account
+        description: "Internal / QA account flag, coalesced to false. Test people stay auditable upstream and are excluded only in marts."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [true, false]
+      - name: email_hash
+        description: "Hashed email on file. Used only to flag two people sharing one hash; never a key."
+      - name: xref_updated_at_utc
+        description: "Last change to the mapping row, in UTC. When it moves, historical events for the affected ids are re-run through identity resolution."
+        data_tests: [not_null]
+
+  - name: stg_ledger__transactions
+    description: >
+      Ledger rows with status codes decoded, naive Pacific timestamps converted to UTC, DST
+      edge cases flagged, high-precision amounts parsed defensively, and the on-chain natural
+      key assembled. Grain: one row per txn_id (latest ingestion wins on exact re-delivery,
+      because a re-delivered ledger row is a restatement). The natural key is NOT unique at
+      this grain: a re-org restatement of the same transfer arrives under a new txn_id, and
+      collapsing those is deliberately left to int_funnel__events so the audit trail survives.
+    columns:
+      - name: txn_id
+        description: "Ledger primary key. Unique after exact re-delivery dedupe."
+        data_tests: [not_null, unique]
+      - name: legacy_user_id
+        description: "Canonical numeric legacy user id (same space as KYC)."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_identity__user_xref')
+                field: legacy_user_id
+              config:
+                severity: warn
+      - name: txn_type
+        description: "Lower-cased transaction type: deposit | trade | withdrawal | internal_transfer. Only deposit and trade feed the funnel."
+        data_tests: [not_null]
+      - name: status_code
+        description: "Raw integer status as delivered. Retained for audit; business SQL must use status_name / is_settled."
+        data_tests: [not_null]
+      - name: status_name
+        description: "Decoded status via the ledger_status_codes seed. Unknown codes surface as 'unknown' instead of silently failing a numeric comparison."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['pending', 'settled', 'failed', 'filled', 'reversed', 'unknown']
+      - name: is_settled
+        description: "True when the status is a terminal success (settled or filled). The only status predicate downstream models are allowed to use."
+        data_tests: [not_null]
+      - name: created_at_local_raw
+        description: "Original naive Pacific wall-clock string, retained so a DST-flagged row can be re-derived once the producer supplies an offset."
+      - name: created_at_utc
+        description: "Creation instant in UTC, converted from Pacific wall-clock through the `source_ledger_timezone` var."
+        data_tests: [not_null]
+      - name: settled_at_utc
+        description: "Settlement instant in UTC. Null until terminal. The funnel uses settled_at_utc when present, else created_at_utc."
+      - name: is_dst_ambiguous_local_time
+        description: "True when the naive local time falls in the repeated fall-back hour (occurs twice). The chosen offset is a guess; the row is flagged rather than silently placed."
+        data_tests: [not_null]
+      - name: is_dst_nonexistent_local_time
+        description: "True when the naive local time falls in the spring-forward gap (never occurred). The warehouse shifts it forward; the row is flagged so the shift is visible."
+        data_tests: [not_null]
+      - name: chain_id
+        description: "EVM chain id for on-chain rows; null for fiat and internal rails."
+      - name: tx_hash
+        description: "Lower-cased on-chain transaction hash. Not unique on its own: batched transfers, multi-chain and re-orgs all reuse it."
+      - name: log_index
+        description: "Transfer log position within the transaction. Distinguishes the two deposits inside one batched transaction."
+      - name: from_address
+        description: "Lower-cased counterparty address. Null on fiat/internal rails (legitimate) AND nulled when the raw value was the zero-address sentinel."
+      - name: is_from_zero_address
+        description: "True when the raw from_address was 0x000...0 (protocol mint/burn). Always two-valued: null addresses yield false, otherwise fiat deposits would fail the success rule downstream."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [true, false]
+      - name: amount_raw
+        description: "Token amount exactly as delivered (string). Preserved so no precision is lost even when the decimal parse fails."
+      - name: usd_notional_raw
+        description: "USD notional exactly as delivered (string)."
+      - name: amount
+        description: "Token amount parsed with try_cast into DECIMAL(38,18). Null (with has_amount_precision_issue = true) when the raw value overflows or is malformed."
+      - name: usd_notional
+        description: "USD notional parsed with try_cast into DECIMAL(38,8). The first-deposit threshold is evaluated on this column; a null can never satisfy it."
+      - name: has_amount_precision_issue
+        description: "True when amount_raw was present but could not be represented in DECIMAL(38,18). Retained and flagged; the funnel does not need the token amount."
+        data_tests: [not_null]
+      - name: has_usd_precision_issue
+        description: "True when usd_notional_raw was present but unparseable. A row with this flag cannot advance the first_deposit step."
+        data_tests: [not_null]
+      - name: ingested_at_utc
+        description: "Warehouse arrival instant in UTC."
+        data_tests: [not_null]
+      - name: ledger_business_key
+        description: "Semantic identity of the transfer: `chain_id:tx_hash:log_index` for on-chain rows, else txn_id. Two ledger rows with the same key describe the same real-world event (e.g. a re-org restatement)."
+        data_tests: [not_null]
+      - name: deposit_rail
+        description: "onchain (has tx_hash) | fiat (deposit without a chain) | internal (everything else). Explains why from_address and chain fields are null without treating null as an error."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['onchain', 'fiat', 'internal']

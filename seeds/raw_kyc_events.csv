@@ -1,0 +1,13 @@
+case_id,customer_ref,status,updated_at_ms,attempt_no,vendor,ingested_at
+k1,001001,APPROVED,1789399200000,1,kyc_vendor,2026-09-14T15:20:00Z
+k2,1002,rejected,1789402800000,1,kyc_vendor,2026-09-14T16:20:00Z
+k2,1002,APPROVED,1789404000000,2,kyc_vendor,2026-09-14T16:40:00Z
+k3,1003,approved,1789372800000,1,kyc_vendor,2026-09-14T08:00:00Z
+k4,1004,approved,1789410000,1,kyc_vendor,2026-09-14T18:20:00Z
+k5,1005,approved,1789413600000,1,kyc_vendor,2026-09-14T19:20:00Z
+k6,1006,approved,1789417200000,1,kyc_vendor,2026-09-14T20:20:00Z
+k6,1006,revoked,1789503600000,2,kyc_vendor,2026-09-15T20:20:00Z
+k7,1007,pending,1789420800000,1,kyc_vendor,2026-09-14T21:20:00Z
+k11,1011,approved,1789424400000,1,kyc_vendor,2026-09-14T22:20:00Z
+kqa,9001,approved,1789427400000,1,kyc_vendor,2026-09-14T23:10:00Z
+kunresolved,9999,approved,1789405200000,1,kyc_vendor,2026-09-14T17:00:00Z

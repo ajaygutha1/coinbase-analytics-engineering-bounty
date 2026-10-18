@@ -1,0 +1,345 @@
+version: 2
+
+# Marts: what a PM or a dashboard is allowed to read. Enforced contract on the person-grain
+# fact, semantic-layer metric definitions on the daily aggregate, and a permanent
+# "which definition of signup" bridge so the Exercise 2 conversation never happens twice.
+
+models:
+  - name: fct_onboarding_funnel
+    description: >
+      **The deliverable.** One row per person (`user_sk`) who has a terminal account-created
+      success, is not a test account, and has a resolved identity. Merged accounts are one row
+      keyed to the surviving account, with the signup taken from the OLDER registration.
+
+      Two readings of the same funnel are exposed side by side. `furthest_step_observed` is the
+      highest step ever completed in any order and is the reporting default because it survives
+      a late KYC webhook or a re-ingested ledger partition. `furthest_step_strict` walks
+      signup -> email -> KYC -> deposit -> trade and stops at the first step that is missing or
+      earlier than its predecessor. `has_sequence_anomaly` and `data_quality_flags` make the
+      disagreement measurable instead of hidden.
+
+      Cohorts are Pacific calendar days (`signup_date_pt`) derived from the UTC instant.
+      The contract is enforced: an upstream type change fails the build instead of the deck.
+      Incremental merge on user_sk, recomputing only people touched since the last load.
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: user_sk
+        description: "Person surrogate key (md5 of the canonical account id). Primary key."
+        data_type: varchar
+        constraints: [{type: not_null}]
+        data_tests: [not_null, unique]
+      - name: account_id
+        description: "Surviving auth account id. For debugging and joins back to source; never a grain."
+        data_type: varchar
+        data_tests: [not_null, unique]
+      - name: signed_up_at_utc
+        description: "First `account_created` success (UTC). Present on every row by definition."
+        data_type: timestamp
+        data_tests: [not_null]
+      - name: email_verified_at_utc
+        description: "First `email_verified` success (UTC); null if never verified."
+        data_type: timestamp
+      - name: identity_verified_at_utc
+        description: "First KYC `approved` (UTC); null if never approved. A later revocation does not clear it (see data_quality_flags)."
+        data_type: timestamp
+      - name: first_deposit_at_utc
+        description: "Settlement of the first deposit at/above `minimum_deposit_usd` from a non-zero address (UTC). Dust and mints never populate this."
+        data_type: timestamp
+      - name: first_trade_at_utc
+        description: "First filled trade (UTC)."
+        data_type: timestamp
+      - name: reached_signed_up
+        description: "Observed reading: has an account_created success. Always true on this table."
+        data_type: boolean
+        data_tests:
+          - accepted_values:
+              arguments: {values: [true]}
+      - name: reached_email_verified
+        description: "Observed reading: has ever verified email."
+        data_type: boolean
+        data_tests: [not_null]
+      - name: reached_identity_verified
+        description: "Observed reading: has ever been KYC approved."
+        data_type: boolean
+        data_tests: [not_null]
+      - name: reached_first_deposit
+        description: "Observed reading: has ever made a qualifying deposit."
+        data_type: boolean
+        data_tests: [not_null]
+      - name: reached_first_trade
+        description: "Observed reading: has ever made a filled trade."
+        data_type: boolean
+        data_tests: [not_null]
+      - name: furthest_step_observed
+        description: "0-5: highest step ever completed, in any order. Reporting default."
+        data_type: integer
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: [1, 2, 3, 4, 5]}
+      - name: furthest_step_strict
+        description: "0-5: steps completed in sequence; stops at the first missing or out-of-order step. Always <= observed (assert_strict_not_above_observed)."
+        data_type: integer
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments: {values: [1, 2, 3, 4, 5]}
+      - name: has_sequence_anomaly
+        description: "observed <> strict. The count of these rows is the size of the ingestion-order problem."
+        data_type: boolean
+        data_tests: [not_null]
+      - name: data_quality_flags
+        description: "Pipe-delimited named reasons: email_before_signup, kyc_before_email, deposit_before_kyc, trade_before_deposit, kyc_revoked_after_approval, late_arriving_event, numeric_precision_issue, dst_ambiguous_local_time, dst_nonexistent_local_time, email_hash_collision. Empty string when clean."
+        data_type: varchar
+        data_tests: [not_null]
+      - name: minutes_to_email_verified
+        description: "Minutes from signup to email verification; null if not verified."
+        data_type: bigint
+      - name: hours_to_identity_verified
+        description: "Hours from signup to first KYC approval; null if not approved."
+        data_type: bigint
+      - name: hours_to_first_deposit
+        description: "Hours from signup to first qualifying deposit; null if none."
+        data_type: bigint
+      - name: hours_to_first_trade
+        description: "Hours from signup to first filled trade; null if none. Negative values are possible and flagged upstream (trade before deposit does not imply trade before signup)."
+        data_type: bigint
+      - name: signup_date_utc
+        description: "UTC calendar date of signup. Kept only to make the UTC-vs-PT boundary auditable; not a reporting column."
+        data_type: date
+        data_tests: [not_null]
+      - name: signup_date_pt
+        description: "**The reporting cohort day**: Pacific calendar date of the signup instant (var `reporting_timezone`)."
+        data_type: date
+        data_tests: [not_null]
+      - name: signup_week_pt
+        description: "Monday of the Pacific week containing signup_date_pt."
+        data_type: date
+        data_tests: [not_null]
+      - name: signup_country
+        description: "Country at signup (auth ip_country). Never re-attributed when the person moves."
+        data_type: varchar
+      - name: kyc_events
+        description: "All KYC status changes seen for the person, including retries."
+        data_type: bigint
+        data_tests: [not_null]
+      - name: kyc_negative_events
+        description: "KYC rejections and revocations. Bob (rejected then approved) has 1 and still converts."
+        data_type: bigint
+        data_tests: [not_null]
+      - name: deposit_events
+        description: "Distinct semantic deposit events (after natural-key dedupe), including non-qualifying ones such as a $0 mint."
+        data_type: bigint
+        data_tests: [not_null]
+      - name: first_deposit_usd
+        description: "USD notional of the first qualifying deposit (DECIMAL(38,8)); always >= minimum_deposit_usd when present."
+        data_type: "decimal(38,8)"
+      - name: first_deposit_rail
+        description: "Rail of the first qualifying deposit: onchain | fiat | internal."
+        data_type: varchar
+        data_tests:
+          - accepted_values:
+              arguments: {values: ['onchain', 'fiat', 'internal']}
+      - name: _loaded_at_utc
+        description: "UTC instant this row was last written. The Friday deck should cite it as its snapshot."
+        data_type: timestamp
+        data_tests: [not_null]
+
+  - name: fct_onboarding_funnel_daily
+    description: >
+      Daily cohort aggregate: one row per Pacific signup day x signup country, with observed
+      and strict step counts, a 7-day trade window and a cohort-maturity flag so yesterday's
+      cohort is not read as a conversion drop. Rebuilt in full on every run; it is a cheap
+      aggregate over the person mart and a full refresh guarantees restated cohorts are right.
+      Carries the dbt semantic-model annotations, so `daily_signups` and the conversion ratios
+      are defined here once and a dashboard cannot define its own version.
+    config:
+      contract:
+        enforced: true
+    semantic_model:
+      enabled: true
+      name: onboarding_funnel_daily
+    agg_time_dimension: signup_date_pt
+    columns:
+      - name: cohort_key
+        data_type: varchar
+        description: "`signup_date_pt|signup_country`. Primary key of the aggregate."
+        entity: {type: primary, name: onboarding_cohort}
+        data_tests: [not_null, unique]
+      - name: signup_date_pt
+        data_type: date
+        description: "Pacific calendar day of signup (the cohort)."
+        granularity: day
+        dimension: {type: time, name: signup_date_pt}
+        data_tests: [not_null]
+      - name: signup_country
+        data_type: varchar
+        description: "Country at signup; 'UNKNOWN' when the auth feed had none."
+        dimension: {type: categorical, name: signup_country}
+        data_tests: [not_null]
+      - name: users_signed_up
+        data_type: bigint
+        description: "Distinct people in the cohort. Denominator for every conversion metric."
+        data_tests: [not_null]
+      - name: users_email_verified_observed
+        data_type: bigint
+        description: "People who ever verified email (any order)."
+      - name: users_identity_verified_observed
+        data_type: bigint
+        description: "People who were ever KYC approved (any order)."
+      - name: users_first_deposit_observed
+        data_type: bigint
+        description: "People who ever made a qualifying deposit (any order)."
+      - name: users_first_trade_observed
+        data_type: bigint
+        description: "People who ever made a filled trade (any order)."
+      - name: users_email_verified_strict
+        data_type: bigint
+        description: "People whose strict walk reached step 2."
+      - name: users_identity_verified_strict
+        data_type: bigint
+        description: "People whose strict walk reached step 3."
+      - name: users_first_deposit_strict
+        data_type: bigint
+        description: "People whose strict walk reached step 4."
+      - name: users_first_trade_strict
+        data_type: bigint
+        description: "People whose strict walk reached step 5 (traded after depositing after KYC after email)."
+      - name: users_first_trade_within_7d
+        data_type: bigint
+        description: "People whose first trade happened within 168 hours of signup. Comparable across cohorts only when is_cohort_mature_7d is true."
+      - name: is_cohort_mature_7d
+        data_type: boolean
+        description: "True once the cohort day is at least 7 days old. Immature cohorts will still grow."
+        data_tests: [not_null]
+      - name: _loaded_at_utc
+        data_type: timestamp
+        description: "Snapshot instant of the underlying person mart."
+    metrics:
+      - name: daily_signups
+        label: Daily Signups
+        description: "Distinct canonical, non-test people whose first account-created success falls on the Pacific calendar day. THE signup number for the deck."
+        type: simple
+        agg: sum
+        expr: users_signed_up
+      - name: identity_verified_observed
+        label: KYC Approved (observed)
+        description: "People in the cohort who were ever KYC approved."
+        type: simple
+        agg: sum
+        expr: users_identity_verified_observed
+      - name: first_deposits_observed
+        label: First Deposits (observed)
+        description: "People in the cohort who ever made a deposit at/above the USD threshold."
+        type: simple
+        agg: sum
+        expr: users_first_deposit_observed
+      - name: first_trades_observed
+        label: First Trades (observed)
+        description: "People in the cohort who ever made a filled trade, regardless of step order."
+        type: simple
+        agg: sum
+        expr: users_first_trade_observed
+      - name: first_trades_strict
+        label: First Trades (strict)
+        description: "People in the cohort who traded after completing every prior step in order."
+        type: simple
+        agg: sum
+        expr: users_first_trade_strict
+
+  - name: rpt_signup_definition_bridge
+    description: >
+      Permanent home for the "52K / 45K / 57K" conversation. One row per Pacific day with the
+      signup count under every definition a stakeholder system might be using: raw event rows
+      (System C shape), distinct accounts on the PT day (System A shape), distinct accounts on
+      the UTC day (the boundary mistake), canonical non-test people (recommended), verified-only
+      people (System B shape), and what the person mart reports. The recommended column and the
+      mart column must agree; the others explain the gaps.
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: signup_date_pt
+        data_type: date
+        description: "Pacific calendar day."
+        data_tests: [not_null, unique]
+      - name: raw_auth_signup_events_pt
+        data_type: bigint
+        description: "account_created rows on the PT day after exact re-delivery dedupe. What an event stream 'reports'."
+        data_tests: [not_null]
+      - name: distinct_accounts_pt
+        data_type: bigint
+        description: "Distinct account ids created on the PT day, before identity merges and test exclusion."
+        data_tests: [not_null]
+      - name: distinct_accounts_utc_day
+        data_type: bigint
+        description: "Distinct account ids whose UTC date equals this date. Differs from distinct_accounts_pt by the 17:00-24:00 PT band."
+        data_tests: [not_null]
+      - name: distinct_people_pt_ex_test
+        data_type: bigint
+        description: "**Recommended definition**: distinct canonical people (merges collapsed) excluding test accounts, by PT day."
+        data_tests: [not_null]
+      - name: distinct_people_verified_pt
+        data_type: bigint
+        description: "Recommended-definition people who have also verified their email (a lifecycle system's 'signup')."
+        data_tests: [not_null]
+      - name: mart_people_pt_ex_test
+        data_type: bigint
+        description: "Rows in fct_onboarding_funnel for this PT day. Must equal distinct_people_pt_ex_test minus unresolved identities."
+        data_tests: [not_null]
+      - name: accounts_same_utc_and_pt_day
+        data_type: bigint
+        description: "Accounts whose UTC and PT dates agree. The complement is the size of the time-zone reconciliation line."
+        data_tests: [not_null]
+  - name: rpt_funnel_data_quality
+    description: >
+      Observability over the person mart. One row per Pacific cohort day x named data-quality flag
+      with the number of people carrying it and its share of the cohort, plus `sequence_anomaly`
+      (observed <> strict) and `clean` (no flags). When a cohort's conversion moves, this table
+      says whether the data moved or the ingestion did.
+    columns:
+      - name: signup_date_pt
+        description: "Pacific cohort day."
+        data_tests: [not_null]
+      - name: flag
+        description: "A value from data_quality_flags, or `sequence_anomaly`, or `clean`."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['clean', 'sequence_anomaly', 'email_before_signup', 'kyc_before_email', 'deposit_before_kyc',
+                         'trade_before_deposit', 'kyc_revoked_after_approval', 'late_arriving_event',
+                         'numeric_precision_issue', 'dst_ambiguous_local_time', 'dst_nonexistent_local_time',
+                         'email_hash_collision']
+      - name: users_flagged
+        description: "Distinct people in the cohort with this flag."
+        data_tests: [not_null]
+      - name: users_in_cohort
+        description: "Cohort size (denominator)."
+        data_tests: [not_null]
+      - name: share_of_cohort
+        description: "users_flagged / users_in_cohort."
+        data_tests: [not_null]
+
+
+metrics:
+  - name: signup_to_trade_conversion_observed
+    label: Signup to Trade Conversion (observed)
+    description: "Share of a signup cohort that has ever traded. Person grain, Pacific cohort day. The default conversion metric."
+    type: ratio
+    numerator: {name: first_trades_observed}
+    denominator: {name: daily_signups}
+  - name: signup_to_trade_conversion_strict
+    label: Signup to Trade Conversion (strict)
+    description: "Share of a signup cohort that traded after completing every prior step in order. Use for sequence-sensitive analysis."
+    type: ratio
+    numerator: {name: first_trades_strict}
+    denominator: {name: daily_signups}
+  - name: signup_to_kyc_conversion
+    label: Signup to KYC Conversion
+    description: "Share of a signup cohort that was ever KYC approved."
+    type: ratio
+    numerator: {name: identity_verified_observed}
+    denominator: {name: daily_signups}

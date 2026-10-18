@@ -1,0 +1,12 @@
+version: 2
+
+# Ownership and access. Every model belongs to the growth_analytics group; staging and
+# intermediate models are `protected` (only this group's models may ref them) and marts are
+# `public`. dbt enforces this at parse time, so a notebook or a dashboard cannot quietly build on
+# an intermediate table and inherit its exclusions.
+
+groups:
+  - name: growth_analytics
+    owner:
+      name: Ajay Gutha
+      email: ajaygutha1@gmail.com

@@ -1,0 +1,129 @@
+version: 2
+
+# Production-shape source declarations for the three event feeds and the identity crosswalk.
+# The challenge names the feeds but not their columns, so these are STATED ASSUMPTIONS, not
+# Coinbase schemas. The runnable demo reads seeds named raw_* instead; flip
+# `use_seed_sources: false` and the staging models read these declarations with no SQL change.
+# Freshness SLAs are deliberately tighter on the ledger: a stale ledger looks like a deposit
+# conversion drop, and that is a pipeline incident, not a Growth story.
+
+sources:
+  - name: auth
+    description: "Authentication / account service event stream. Owns `account_created` and `email_verified`. The only feed that already emits UTC (ISO-8601 with Z)."
+    schema: raw_auth
+    tables:
+      - name: auth_events
+        description: "Append-only auth events. Exact re-deliveries share an event_id; account ids arrive with inconsistent casing between services."
+        loaded_at_field: ingested_at
+        config:
+          freshness:
+            warn_after: {count: 2, period: hour}
+            error_after: {count: 12, period: hour}
+        columns:
+          - name: event_id
+            description: "Event identifier. Re-delivered on retry, so it is unique only after dedupe."
+          - name: account_id
+            description: "UUID-style account identifier. Casing varies by producer."
+          - name: email_hash
+            description: "Hashed email at time of event. Tempting as a join key; people change emails, so it is never a key here."
+          - name: event_name
+            description: "Event type. Only `account_created` and `email_verified` feed the funnel; other names are noise."
+          - name: event_ts
+            description: "Event instant as ISO-8601 with a Z suffix (UTC)."
+          - name: device_id
+            description: "Device that fired the event. Attribute only; devices are shared and unstable."
+          - name: ip_country
+            description: "Country inferred at the event. Kept as country-at-signup, never as a current-country attribute."
+          - name: ingested_at
+            description: "Warehouse arrival instant. Drives the incremental watermark and the late-arrival flag."
+
+  - name: kyc
+    description: "KYC vendor webhook feed. Owns identity verification status history. Keyed by a numeric legacy customer reference, not the auth account id."
+    schema: raw_kyc
+    tables:
+      - name: kyc_events
+        description: "One row per status change per case. Retries (rejected -> approved) and regressions (approved -> revoked) are real history, not duplicates."
+        loaded_at_field: ingested_at
+        config:
+          freshness:
+            warn_after: {count: 2, period: hour}
+            error_after: {count: 12, period: hour}
+        columns:
+          - name: case_id
+            description: "Vendor case identifier. One case has many status rows."
+          - name: customer_ref
+            description: "Numeric legacy user id, sometimes zero-padded (`001001`). Same id space as the ledger, not auth."
+          - name: status
+            description: "Vendor status string with inconsistent casing: pending, rejected, approved, revoked."
+          - name: updated_at_ms
+            description: "Epoch timestamp, nominally milliseconds. Some rows arrive in seconds after SDK changes."
+          - name: attempt_no
+            description: "Retry counter within a case."
+          - name: vendor
+            description: "KYC vendor name."
+          - name: ingested_at
+            description: "Warehouse arrival instant (ISO-8601 Z)."
+
+  - name: ledger
+    description: "Ledger of deposits, trades, withdrawals and internal moves. Owns first deposit and first trade. Timestamps are naive Pacific wall-clock; on-chain rows carry chain metadata."
+    schema: raw_ledger
+    tables:
+      - name: ledger_transactions
+        description: "One row per ledger transaction id, with possible exact re-deliveries and re-org restatements of the same on-chain transfer under a new txn_id."
+        loaded_at_field: ingested_at
+        config:
+          freshness:
+            warn_after: {count: 30, period: minute}
+            error_after: {count: 2, period: hour}
+        columns:
+          - name: txn_id
+            description: "Ledger primary key. Unique after exact re-delivery dedupe. NOT the same as the on-chain identity of a transfer."
+          - name: user_id
+            description: "Numeric legacy user id (same space as kyc.customer_ref)."
+          - name: txn_type
+            description: "deposit | trade | withdrawal | internal_transfer. Only deposit and trade feed the funnel."
+          - name: status_code
+            description: "Integer status 0-4. Magic numbers: 1 (settled) and 3 (filled) both mean success. Decoded via the ledger_status_codes seed."
+          - name: created_at_local
+            description: "Naive Pacific wall-clock timestamp with no offset. Ambiguous for one hour each November and nonexistent for one hour each March."
+          - name: settled_at_local
+            description: "Naive Pacific wall-clock settlement timestamp. Null until terminal."
+          - name: chain_id
+            description: "EVM chain id for on-chain rows; null for fiat and internal rails."
+          - name: tx_hash
+            description: "On-chain transaction hash. NOT unique: one tx can emit several transfer logs, the same hash can exist on two chains, and a re-org can re-emit it."
+          - name: log_index
+            description: "Position of the transfer log within the transaction. Together with chain_id and tx_hash it forms the natural key of an on-chain transfer."
+          - name: from_address
+            description: "Counterparty address. Null on fiat/internal rails (legitimate). `0x000...0` is the protocol mint/burn sentinel, not a customer."
+          - name: amount
+            description: "Token amount as delivered. May exceed 38 digits for base-unit integers, so it is parsed defensively."
+          - name: usd_notional
+            description: "USD value at execution. The first-deposit threshold is evaluated on this column."
+          - name: ingested_at
+            description: "Warehouse arrival instant (ISO-8601 Z)."
+
+  - name: identity
+    description: "Account <-> legacy user id crosswalk maintained by the identity/support team. Carries account merges and the test-account flag. Without it the three feeds cannot be joined."
+    schema: raw_identity
+    tables:
+      - name: user_xref
+        description: "One row per auth account. `merged_into_account_id` points at the surviving account when support merges two registrations."
+        loaded_at_field: updated_at_utc
+        config:
+          freshness:
+            warn_after: {count: 6, period: hour}
+            error_after: {count: 24, period: hour}
+        columns:
+          - name: account_id
+            description: "Auth account id (UUID-style)."
+          - name: legacy_user_id
+            description: "Numeric legacy id used by KYC and the ledger."
+          - name: merged_into_account_id
+            description: "Surviving account when this account was merged; null otherwise."
+          - name: is_test_account
+            description: "Internal / QA account flag. Inherited across merges."
+          - name: email_hash
+            description: "Hashed email on file. Used only to detect two people sharing one email hash."
+          - name: updated_at_utc
+            description: "Last change to this mapping row. Drives re-processing of historical events when identity changes."

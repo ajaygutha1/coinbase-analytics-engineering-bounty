@@ -1,0 +1,6 @@
+status_code,status_name,is_settled
+0,pending,false
+1,settled,true
+2,failed,false
+3,filled,true
+4,reversed,false

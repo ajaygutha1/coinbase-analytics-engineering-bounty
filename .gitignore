@@ -1,0 +1,23 @@
+# Python / dbt runtime
+.venv/
+__pycache__/
+target/
+logs/
+dbt_packages/
+.user.yml
+*.duckdb
+*.duckdb.wal
+
+# Generated Exercise 2 fixtures (deterministic; regenerate with scripts/ex2_make_fixtures.py)
+data/ex2/*.csv
+data/ex2/*.json
+
+# Personal documents never go in the repo history
+submission/*.pdf
+
+.DS_Store
+
+# Local-only submission notes (never published)
+submission/FINAL_CHECKLIST.md
+submission/VALIDATION_STATUS.md
+submission/AI_DISCLOSURE_AFTER_GREEN_CI.md

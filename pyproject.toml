@@ -1,0 +1,17 @@
+[project]
+name = "coinbase-analytics-engineering-bounty"
+version = "1.0.0"
+description = "dbt + DuckDB reference implementation of an exchange onboarding funnel (Coinbase Insights to Impact bounty, 2026)"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv", "target", "dbt_packages"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests_py"]
+addopts = "-q"

@@ -1,0 +1,8 @@
+coinbase_bounty:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: coinbase_bounty.duckdb
+      schema: analytics
+      threads: 4
