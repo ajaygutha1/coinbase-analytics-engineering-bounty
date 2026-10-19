@@ -3,7 +3,7 @@
 [![dbt-bounty-ci](https://github.com/ajaygutha1/coinbase-analytics-engineering-bounty/actions/workflows/dbt.yml/badge.svg)](https://github.com/ajaygutha1/coinbase-analytics-engineering-bounty/actions/workflows/dbt.yml)
 ![dbt-core 1.12](https://img.shields.io/badge/dbt--core-1.12-FF694B?logo=dbt&logoColor=white)
 ![DuckDB 1.5](https://img.shields.io/badge/DuckDB-1.5-FFF000?logo=duckdb&logoColor=black)
-![tests](https://img.shields.io/badge/dbt%20tests-281%20passing-16a34a)
+![tests](https://img.shields.io/badge/dbt%20tests-238%20passing-16a34a)
 ![license MIT](https://img.shields.io/badge/license-MIT-blue)
 
 A runnable answer to the Coinbase *Insights to Impact* Analytics Engineer bounty (2026). The
@@ -50,8 +50,9 @@ the source shapes are stated assumptions.
 8. [Engineering practices](#engineering-practices)
 9. [Questions a reviewer might ask](#questions-a-reviewer-might-ask)
 10. [Repository map](#repository-map)
-11. [Configuration](#configuration)
-12. [Known limits](#known-limits)
+11. [Production mapping](#production-mapping)
+12. [Configuration](#configuration)
+13. [Known limits](#known-limits)
 
 ---
 
@@ -64,8 +65,8 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt            # dbt-core, dbt-duckdb, duckdb (pinned)
 export DBT_PROFILES_DIR=.
 
-dbt seed                                   # 9 synthetic fixtures
-dbt build --exclude resource_type:seed     # 18 models, 8 unit tests, 247 data tests, 6 enforced contracts
+dbt seed                                   # 10 synthetic fixtures
+dbt build --exclude resource_type:seed     # 18 models, 8 unit tests, 214 data tests, enforced contracts on every mart
 dbt build --exclude resource_type:seed     # again: exercises the incremental merge / watermark paths
 
 python scripts/ex2_make_fixtures.py        # builds the 52K / 45K / 57K day with known causes
@@ -77,7 +78,7 @@ make lint test replay                      # ruff + sqlfluff + static checks; py
 dbt docs generate && dbt docs serve        # column-level docs for every model
 ```
 
-Expected: `Done. PASS=266 WARN=2 ERROR=0`. Both warnings are intentional and come from the same
+Expected: `Done. PASS=238 WARN=2 ERROR=0`. Both warnings are intentional and come from the same
 planted row, a KYC case whose `customer_ref` (9999) matches no person. It is flagged, counted and
 kept upstream, never dropped silently.
 
@@ -89,35 +90,91 @@ To point the staging layer at real warehouse tables instead of seeds, declare th
 
 ## Architecture
 
-### DAG
+### System overview
 
-Generated from the manifest: [docs/LINEAGE.md](docs/LINEAGE.md) (Mermaid, rendered by GitHub).
+Four feeds with four identifier and timestamp conventions go in; one person-level table and one
+governed metric layer come out. Each layer has one job and its own gates.
 
-```text
-raw_* seeds  (or production source() declarations)
-   │
-   ▼
-stg_auth__events   stg_kyc__events   stg_ledger__transactions   stg_identity__user_xref      [protected]
-   └──────────────────┬───────────────────────┬─────────────────────────┘
-                      ▼                       │
-              int_identity__resolved ◄────────┘        one row per account AND per legacy id → user_sk
-                      │
-                      ▼
-               int_funnel__events                     one row per semantic event; flags, never deletes
-                      │
-                      ▼
-             int_funnel__user_steps                   one row per person × step; first terminal success
-                      │
-                      ▼
-              fct_onboarding_funnel                   one row per PERSON, enforced contract  ← the deliverable   [public]
-        ┌─────────────┼──────────────────────┐
-        ▼             ▼                      ▼
-fct_onboarding_   rpt_signup_            rpt_funnel_data_quality
-funnel_daily      definition_bridge      (flags per cohort)
-(+ semantic model, metrics, exposure: Growth Friday deck)
+```mermaid
+flowchart LR
+  classDef src fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
+  classDef mid fill:#e5e7eb,stroke:#4b5563,color:#0f172a
+  classDef pub fill:#dcfce7,stroke:#15803d,color:#0f172a
+  classDef gate fill:#fef3c7,stroke:#b45309,color:#0f172a
+  classDef use fill:#ede9fe,stroke:#6d28d9,color:#0f172a
 
-ex3_* seeds ─► fct_weekly_active_traders v1 (legacy, verbatim) | v2 (people) ─► rpt_weekly_active_traders_bridge   [public]
+  subgraph S["Sources: four feeds, four conventions"]
+    direction TB
+    A1[("auth_events<br/>UUID account_id<br/>ISO-8601 Z")]:::src
+    A2[("kyc_events<br/>legacy customer_ref<br/>epoch s or ms")]:::src
+    A3[("ledger_transactions<br/>legacy user_id<br/>naive Pacific time")]:::src
+    A4[("identity_user_xref<br/>account to legacy id<br/>merges and test flags")]:::src
+  end
+
+  G0{{"Gate 0<br/>freshness SLAs"}}:::gate
+
+  subgraph ST["Staging, protected views"]
+    direction TB
+    B1["stg_auth__events"]:::mid
+    B2["stg_kyc__events"]:::mid
+    B3["stg_ledger__transactions"]:::mid
+    B4["stg_identity__user_xref"]:::mid
+  end
+
+  subgraph IN["Intermediate, protected"]
+    direction TB
+    C1["int_identity__resolved<br/>one key per person"]:::mid
+    C2["int_funnel__events<br/>one row per semantic event"]:::mid
+    C3["int_funnel__user_steps<br/>person x step"]:::mid
+  end
+
+  subgraph M["Marts, public, enforced contracts"]
+    direction TB
+    D1["fct_onboarding_funnel<br/>one row per person"]:::pub
+    D2["fct_onboarding_funnel_daily<br/>cohorts and metrics"]:::pub
+    D3["rpt_funnel_data_quality"]:::pub
+    D4["rpt_signup_definition_bridge"]:::pub
+  end
+
+  subgraph W["Weekly active traders, versioned"]
+    direction TB
+    E1["v1 legacy, verbatim"]:::pub
+    E2["v2 people grain"]:::pub
+    E3["rpt_weekly_active_traders_bridge"]:::pub
+  end
+
+  U(["Growth Friday review<br/>exposure and semantic layer"]):::use
+
+  A1 --> G0
+  A2 --> G0
+  A3 --> G0
+  A4 --> G0
+  G0 --> B1 & B2 & B3 & B4
+  B4 --> C1
+  B1 & B2 & B3 --> C2
+  C1 --> C2
+  C2 --> C3
+  C3 --> D1
+  D1 --> D2 & D3 & D4
+  D2 --> U
+  E1 --> E3
+  E2 --> E3
+  E3 --> U
 ```
+
+Seven more diagrams explain the rest, in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md):
+
+| Diagram | Question it answers |
+|---|---|
+| [Quality gates by layer](docs/ARCHITECTURE.md#2-quality-gates-by-layer) | Where does a bad row get stopped? |
+| [Life of an event](docs/ARCHITECTURE.md#3-life-of-an-event) | What happens to one messy row? |
+| [Identity resolution](docs/ARCHITECTURE.md#4-identity-resolution) | How does one person get one key? |
+| [Incremental and late arrivals](docs/ARCHITECTURE.md#5-incremental-processing-and-late-arrivals) | What happens when data arrives late? |
+| [Exercise map and the fan-out thread](docs/ARCHITECTURE.md#6-exercise-map-and-the-fan-out-thread) | How do the four exercises connect? |
+| [CI pipeline](docs/ARCHITECTURE.md#7-ci-pipeline) | What proves it works on every push? |
+| [Production mapping](docs/ARCHITECTURE.md#8-production-mapping) | How would it run on a production stack? |
+
+The model-level DAG generated from the dbt manifest is [docs/LINEAGE.md](docs/LINEAGE.md).
 
 ### Layer rules
 
@@ -241,7 +298,7 @@ Every row in `seeds/` is there to break something specific. Each has a model dec
 | Layer | What it proves | Count |
 |---|---|---|
 | Unit tests (fixture rows, no warehouse data) | dedupe direction, epoch decoding, precision overflow, zero-address sentinel, both DST edges, observed-vs-strict walk, Pacific boundary, multi-hop and dangling merges flagged | 8 |
-| Schema tests (`unique`, `not_null`, `accepted_values`, `relationships`) | each model has the grain it claims; enums are closed; flags are two-valued; the crosswalk cannot fan out | 211 |
+| Schema tests (`unique`, `not_null`, `accepted_values`, `relationships`) | each model has the grain it claims; enums are closed; flags are two-valued; the crosswalk cannot fan out | 178 |
 | Singular tests (business invariants) | funnel monotonic; **mart reconciles to event layer** (catches silent row loss, which uniqueness cannot); no future events; PT/UTC never drift > 1 day; natural keys unique after semantic dedupe; legacy output frozen (characterization); per-country refactor parity; every planted case | 36 |
 | Enforced contracts | column names and types frozen on every mart | 6 |
 | Warn-level tests | known-imperfect inputs do not block the deck | 2 |
@@ -337,7 +394,7 @@ Because you cannot prove a refactor preserved a metric without a frozen baseline
 Enforced contracts and BI tools are happier with scalar types across warehouses. `rpt_funnel_data_quality` unnests it, so analysts get the array view without the mart depending on array support.
 
 **What would you change for Snowflake or BigQuery?**
-Nothing in the model logic. Swap the profile, replace the DuckDB `generate_series` time spine with the warehouse equivalent, add `cluster_by` / partitioning on `ingested_at_utc` for the event table and `signup_date_pt` for the mart, and add `incremental_predicates` so the merge scans only the lookback window. The macros isolate the two DuckDB-specific functions (`timezone`, `try_cast`) already.
+Little in the model logic. Swap the profile, replace the DuckDB `generate_series` time spine with the warehouse equivalent, add `cluster_by` / partitioning on `ingested_at_utc` for the event table and `signup_date_pt` for the mart, and add `incremental_predicates` so the merge scans only the lookback window. The full component mapping and a construct-by-construct dialect table are in [Production mapping](#production-mapping).
 
 **How do you know the incremental logic works, not just the full refresh?**
 CI runs `dbt build` twice on every push. The second run takes the merge / delete+insert paths, and the tests run again on the result.
@@ -368,10 +425,97 @@ seeds/            planted fixtures, documented column by column in seeds.yml
 scripts/          ex2_diagnose.py (blind diagnostic), ex2_make_fixtures.py, ex2_reconcile_signups.py,
                   ex3_make_fixtures.py, ex4_fanout_bridge.py, validate_funnel_fixture.py,
                   render_lineage.py, static_validate.py
-docs/             adr/, LINEAGE.md, EXERCISE2_PM_MEMO.md, EXERCISE4_TALK_TRACK.md,
+docs/             adr/, ARCHITECTURE.md (eight diagrams), LINEAGE.md, EXERCISE2_PM_MEMO.md, EXERCISE4_TALK_TRACK.md,
                   FAILURE_MODE_REVIEW.md, BUILD_VERIFICATION_REVIEW.md
 .github/          dbt.yml (CI), pages.yml (manual docs publish)
 ```
+
+---
+
+## Production mapping
+
+The project runs on DuckDB so anyone can build and test it in seconds with no credentials. The
+model logic is warehouse-neutral by design: the time-zone, cast and epoch calls are isolated in macros, the remaining dialect-specific constructs are listed below, and
+`use_seed_sources: false` already points staging at `source()` declarations. The tables below map
+each part to the tooling a large analytics team typically runs and list the exact dialect swaps. Only
+the DuckDB path is executed in CI.
+
+```mermaid
+flowchart LR
+  classDef here fill:#dcfce7,stroke:#15803d,color:#0f172a
+  classDef prod fill:#dbeafe,stroke:#1d4ed8,color:#0f172a
+  classDef same fill:#e5e7eb,stroke:#4b5563,color:#0f172a
+
+  subgraph HERE["This repository"]
+    direction TB
+    H1["CSV seeds"]:::here
+    H2["DuckDB"]:::here
+    H3["GitHub Actions<br/>make all"]:::here
+    H4["exposure and<br/>MetricFlow YAML"]:::here
+    H5["dbt groups and access"]:::here
+    H6["rpt_funnel_data_quality"]:::here
+  end
+
+  subgraph SAME["Unchanged"]
+    direction TB
+    S1["dbt models, tests,<br/>contracts, unit tests"]:::same
+    S2["Macros isolating<br/>dialect-specific calls"]:::same
+  end
+
+  subgraph PROD["Production counterpart"]
+    direction TB
+    P1["Raw tables landed by<br/>ingestion and CDC"]:::prod
+    P2["Snowflake, BigQuery<br/>or Databricks SQL"]:::prod
+    P3["Airflow or dbt Cloud job<br/>with source freshness first"]:::prod
+    P4["Looker or Tableau<br/>reading governed metrics"]:::prod
+    P5["Warehouse roles and<br/>grants config"]:::prod
+    P6["Alerting on the<br/>quality report"]:::prod
+  end
+
+  H1 --> P1
+  H2 --> P2
+  H3 --> P3
+  H4 --> P4
+  H5 --> P5
+  H6 --> P6
+  H1 -.-> S1
+  H2 -.-> S2
+```
+
+### Component mapping
+
+| Concern | In this repository | Production counterpart | What changes |
+|---|---|---|---|
+| Raw data | `seeds/` CSVs with planted problems | Raw tables landed by ingestion or CDC | `--vars '{use_seed_sources: false}'`; the `source()` declarations and freshness SLAs already exist |
+| Warehouse | DuckDB in process | Snowflake, BigQuery or Databricks SQL | New `profiles.yml` target plus the dialect swaps below |
+| Orchestration | GitHub Actions running `make all` | Airflow or dbt Cloud job | Run `dbt source freshness` first, then `dbt build`; a stale feed stops the run |
+| Pull request checks | Lint job then full build | Slim CI: `dbt build --select state:modified+ --defer --state <prod artifacts>` | Add a stored production manifest |
+| Metrics and BI | `exposure` plus MetricFlow semantic model | Looker or Tableau reading the governed metrics | Point the BI tool at the daily mart; definitions stay in YAML |
+| Access control | dbt groups and `access: protected` or `public` | Warehouse roles and dbt `grants:` config | Grant `select` on marts only; staging and intermediate stay private |
+| Observability | `rpt_funnel_data_quality`, warn-level tests | Alert on freshness errors and on quality flag rates | Route test failures and report thresholds to the on-call channel |
+| Documentation | `dbt docs generate` | Hosted dbt docs or a data catalog | Publish the manifest and catalog artifacts the CI job already uploads |
+| Scale | Incremental merge with ingestion-time watermark | Same, plus partition or cluster keys | `ingested_at_utc` on the event table, `signup_date_pt` on the mart |
+
+### Dialect swaps
+
+These are the only places the SQL is not portable. Each is small and local.
+
+| Construct (where) | DuckDB (here) | Snowflake | BigQuery |
+|---|---|---|---|
+| Time zone conversion (`macros/timezones.sql`) | `timezone('zone', ts)` | `convert_timezone('zone', ts)` | `datetime(ts, 'zone')` and `timestamp(dt, 'zone')` |
+| Safe cast (`macros/safe_numeric.sql`) | `try_cast(x as t)` | `try_cast(x as t)` | `safe_cast(x as t)` |
+| Epoch to timestamp (`epoch_mixed_to_utc`) | `to_timestamp(seconds)` | `to_timestamp(seconds)` | `timestamp_seconds(seconds)` |
+| Conditional aggregate (26 uses of `count(*) filter (where ...)`) | `filter (where ...)` | `count_if(...)` or `sum(case ...)` | `countif(...)` |
+| Day spine (`metricflow_time_spine.sql`) | `unnest(generate_series(...))` | `dbt.date_spine` or `generator` | `unnest(generate_date_array(...))` |
+| Date difference | `date_diff('unit', a, b)` | `datediff(unit, a, b)` | `date_diff(b, a, unit)` (argument order differs) |
+| Delimited string split | `string_split(s, '\|')` | `split(s, '\|')` | `split(s, '\|')` |
+| 18-decimal amounts | `decimal(38,18)` | `number(38,18)` | `bignumeric`; `numeric` keeps only 9 decimals |
+| `delete+insert` incremental (`int_funnel__user_steps`) | supported | supported | not supported; use `merge` or `insert_overwrite` on a date partition |
+| Merge scan cost | full target scan | `incremental_predicates` on the lookback window | partition filter plus `incremental_predicates` |
+
+To port, add the macro per column above (for example a `convert_tz` macro that dispatches on
+`target.type`), then run the same `make all` against the new target. The unit tests and the Python
+oracle are what make that safe: they fail if the new dialect changes a decoded value.
 
 ---
 

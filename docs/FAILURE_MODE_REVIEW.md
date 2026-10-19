@@ -76,7 +76,7 @@ The mart ships two readings: `furthest_step_observed` (highest success ever seen
 
 **Implemented guardrail:** the daily mart embeds dbt 1.12 semantic annotations. Weekly active traders is a versioned model: v1 is the legacy user×device definition with a deprecation date, v2 is the person-grain definition. This supports a controlled dual-run rather than silently rewriting history.
 
-## 9. What I would run before submission
+## 9. What to run before a release
 
 ```bash
 export DBT_PROFILES_DIR=.

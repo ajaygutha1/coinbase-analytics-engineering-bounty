@@ -124,23 +124,6 @@ def check_refs() -> None:
     if missing:
         fail(f"refs to missing models/seeds: {missing}")
 
-def prose_word_count(markdown: str) -> int:
-    # Challenge excludes code blocks. Remove fenced code and top note before counting.
-    text = re.sub(r"```.*?```", " ", markdown, flags=re.S)
-    text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
-    return len(re.findall(r"\b[\w’'-]+\b", text))
-
-
-def check_submission_word_count() -> None:
-    path = ROOT / "submission" / "SUBMISSION_DRAFT.md"
-    if not path.exists():
-        return
-    words = prose_word_count(path.read_text())
-    if words > 1450:
-        fail(f"submission prose is {words} words; target <=1450")
-    print(f"submission prose word count (code excluded): {words}")
-
-
 def main() -> None:
     check_required()
     check_yaml()
@@ -148,7 +131,6 @@ def main() -> None:
     check_csv_widths()
     check_guardrails()
     check_refs()
-    check_submission_word_count()
     n_sql_tests = len(list(ROOT.joinpath("tests").glob("*.sql")))
     n_unit = (ROOT / "models/staging/_unit_tests.yml").read_text().count("  - name:")
     print(f"PASS: static checks; {n_sql_tests} singular SQL tests; {n_unit} unit-test definitions")

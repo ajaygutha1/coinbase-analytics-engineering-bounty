@@ -16,8 +16,3 @@ data/ex2/*.json
 submission/*.pdf
 
 .DS_Store
-
-# Local-only submission notes (never published)
-submission/FINAL_CHECKLIST.md
-submission/VALIDATION_STATUS.md
-submission/AI_DISCLOSURE_AFTER_GREEN_CI.md

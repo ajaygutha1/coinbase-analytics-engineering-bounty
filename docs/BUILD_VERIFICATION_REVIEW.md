@@ -19,7 +19,7 @@ what broke, and re-checked every planted case against the design table. It compl
 | 8 | DST | Spring-forward gap (02:xx on the March change date) was silently shifted +1h; the November heuristic was hard-coded to hour 1 / first Sunday. | Inline calendar arithmetic. | Zone-agnostic round-trip macros `is_dst_ambiguous_local` / `is_dst_nonexistent_local`; both flagged, neither guessed. | Unit test `ledger_dst_edge_cases_are_flagged_not_guessed`. |
 | 9 | Fidelity | Weekly-active-trader v1/v2 hard-coded `date '2026-09-07'` and `100` signups and applied no week window. | Proof-of-concept shortcut. | Both versions derive the PT week from `ex3_week_start_pt`, filter trades to it, and count signups from `ex3_users`. Results unchanged (41 / 34 / 100). | `assert_legacy_fanout_gap_exact`. |
 | 10 | Completeness | The signup-definition bridge lacked the UTC-day and verified-only definitions, i.e. the two that actually explain 52K vs 45K. | — | Added `distinct_accounts_utc_day` and `distinct_people_verified_pt`. | Column tests. |
-| 11 | Hygiene | `pandas` pinned but unused; `dbt-core==1.12.0` pinned while 1.12.5 is current; `.user.yml` (dbt telemetry cookie) shipped in the zip; resume PDF and submission drafts sat at repo root. | — | Requirements pinned to the versions that ran; `.user.yml` ignored; personal/submission material moved to `submission/` with the PDF git-ignored. | — |
+| 11 | Hygiene | `pandas` pinned but unused; `dbt-core==1.12.0` pinned while 1.12.5 is current; `.user.yml` (dbt telemetry cookie) shipped in the zip; resume PDF and submission notes sat at repo root. | — | Requirements pinned to the versions that ran; `.user.yml` ignored; personal/submission material moved to `submission/` with the PDF git-ignored. | — |
 
 ## What was checked and found correct
 
@@ -30,7 +30,7 @@ what broke, and re-checked every planted case against the design table. It compl
 - Precision: a 39-digit amount becomes a flag; an unparseable USD notional can never advance the deposit step.
 - Exercise 2 and 4 scripts reproduce 57,000 → 52,000 → 50,007 → 45,003 (residual 0) and 41% vs 34%.
 
-## Final state
+## State after the pass
 
 `dbt build --full-refresh` and a following incremental `dbt build`: **0 errors, 2 intended warnings**
 (both are customer_ref 9999). `dbt compile --vars '{use_seed_sources: false}'` succeeds, proving
@@ -55,5 +55,5 @@ observability mart (`rpt_funnel_data_quality`), eight ADRs, Mermaid lineage gene
 manifest, ruff + sqlfluff + pytest in a separate CI lint job, a Makefile, pre-commit config, MIT
 licence, and a manual GitHub Pages workflow for the dbt docs site.
 
-Final state after the pass: `dbt build --full-refresh` **250 pass, 2 intended warnings, 0 errors**;
+After the pass: `dbt build --full-refresh` **250 pass, 2 intended warnings, 0 errors**;
 incremental build 214 pass; ruff and sqlfluff clean; 5 pytest tests pass; all proof scripts pass.

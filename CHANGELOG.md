@@ -2,6 +2,12 @@
 
 All notable changes to this project. Dates are 2026.
 
+## 10-18 — architecture diagrams and production mapping
+- `docs/ARCHITECTURE.md`: eight Mermaid diagrams (system overview, quality gates by layer, life of an event, identity resolution, incremental and late arrivals, exercise map with the fan-out thread, CI pipeline, production mapping).
+- README: system-overview diagram replaces the ASCII DAG; new Production mapping section with a component table and a construct-by-construct dialect table.
+- README test counts corrected to the build output (PASS=238 WARN=2).
+- Submission notes removed from the repository; `static_validate.py` no longer reads them.
+
 ## 09-30 — proofs instead of prose
 - `scripts/incremental_replay.py`: injects a late-arriving KYC approval, runs the incremental path, asserts only the touched person was recomputed and the cohort moved by one. Runs in CI.
 - Exercise 3 characterization test: `rpt_ex3_legacy_characterization` (verbatim legacy, per country) vs `seeds/ex3_legacy_expected.csv`; bridge decomposition tested to add back up to it.
