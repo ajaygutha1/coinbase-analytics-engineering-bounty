@@ -8,7 +8,7 @@
 
 A runnable answer to the Coinbase *Insights to Impact* Analytics Engineer bounty (2026). The
 challenge ships **no data**, so this repo ships **synthetic seed data with every trap planted on
-purpose** and a dbt project (DuckDB) whose tests prove each trap is handled. It runs in about two
+purpose** and a dbt project (DuckDB) whose tests prove each trap is handled. It builds in under ten
 seconds and needs nothing but Python. Nothing here claims to reproduce Coinbase production schemas;
 the source shapes are stated assumptions.
 
@@ -30,7 +30,7 @@ the source shapes are stated assumptions.
 
 1. **The deliverable** — [`models/marts/fct_onboarding_funnel.sql`](models/marts/fct_onboarding_funnel.sql) (one row per person, two funnel readings) and its contract in [`_marts.yml`](models/marts/_marts.yml).
 2. **Where the judgment lives** — [`int_funnel__events.sql`](models/intermediate/int_funnel__events.sql): the on-chain natural key, terminal-success rule, LEFT joins to identity, ingestion-time watermark.
-3. **Proof it handles the mess** — [`seeds/seeds.yml`](seeds/seeds.yml) lists every planted trap; [`tests/`](tests/) and [`_unit_tests.yml`](models/staging/_unit_tests.yml) catch each one. `make build` runs them in two seconds.
+3. **Proof it handles the mess** — [`seeds/seeds.yml`](seeds/seeds.yml) lists every planted trap; [`tests/`](tests/) and [`_unit_tests.yml`](models/staging/_unit_tests.yml) catch each one. `make build` runs them in under ten seconds.
 4. **Exercise 2** — run [`scripts/ex2_diagnose.py`](scripts/ex2_diagnose.py) on the generated CSVs and read [`docs/EXERCISE2_PM_MEMO.md`](docs/EXERCISE2_PM_MEMO.md), the message the PM would get.
 5. **Exercise 3** — [`analyses/ex3_legacy_weekly_active_traders.sql`](analyses/ex3_legacy_weekly_active_traders.sql) (verbatim, seven flags) → [`…_refactored…`](analyses/ex3_refactored_weekly_active_traders.sql) → [`…_parity_query.sql`](analyses/ex3_parity_query.sql).
 6. **Exercise 4** — [`rpt_weekly_active_traders_bridge`](models/weekly/rpt_weekly_active_traders_bridge.sql) and [`docs/EXERCISE4_TALK_TRACK.md`](docs/EXERCISE4_TALK_TRACK.md), the hallway conversation and the one slide.
